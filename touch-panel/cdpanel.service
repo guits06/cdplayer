@@ -1,0 +1,22 @@
+[Unit]
+Description=Native C++ CD Player Touch Panel (SDL2 KMS/DRM)
+After=cdplayer.service getty@tty1.service
+Wants=cdplayer.service
+Conflicts=getty@tty1.service
+ConditionPathExists=/dev/dri/card0
+
+[Service]
+Type=simple
+User=root
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=SDL_VIDEODRIVER=kmsdrm
+ExecStart=/home/guille/panel/cdpanel
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

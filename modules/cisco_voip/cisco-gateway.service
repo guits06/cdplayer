@@ -1,0 +1,19 @@
+[Unit]
+Description=Cisco IP Phone 7940 VoIP & Bluetooth Gateway Daemon
+After=network.target cisco-dnsmasq.service bluealsa.service bluetooth.service
+Wants=cisco-dnsmasq.service cisco-sync.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cisco_gateway
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Zero-bloat resource control
+MemoryMax=64M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

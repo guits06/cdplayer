@@ -1,0 +1,27 @@
+{
+  "id": "/visualizer.html",
+  "short_name": "Visualizer",
+  "name": "Hi-Fi CD Visualizer",
+  "description": "Visualizador Hi-Fi a pantalla completa para Raspberry Pi CD Player",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "scope": "/",
+  "background_color": "#070709",
+  "theme_color": "#070709",
+  "display": "standalone",
+  "display_override": ["standalone", "fullscreen"],
+  "orientation": "any"
+}

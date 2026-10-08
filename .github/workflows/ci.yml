@@ -1,0 +1,65 @@
+name: CI Build & Verification
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build & Lint Core Components
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            g++ \
+            make \
+            libasound2-dev \
+            libsdl2-dev \
+            libsdl2-ttf-dev \
+            libsdl2-image-dev \
+            libcurl4-openssl-dev \
+            libpulse-dev
+
+      - name: Verify Python Syntax
+        run: |
+          python -m py_compile \
+            main.py \
+            rpi_audio_receiver.py \
+            modules/cisco_voip/cisco_sync.py \
+            modules/study_mode/study_backend.py \
+            pc_send/pc_audio_sender.py \
+            touch-panel/panel_server.py
+
+      - name: Build Bit-Perfect CDDA C Audio Engine
+        run: |
+          make clean
+          make
+
+      - name: Build Cisco VoIP SIP Gateway (C)
+        run: |
+          make -C modules/cisco_voip clean || true
+          make -C modules/cisco_voip
+
+      - name: Build Touch Panel (SDL2 / C++)
+        run: |
+          make -C touch-panel clean || true
+          make -C touch-panel
+
+      - name: Build Linux PC Streamer (C++)
+        run: |
+          g++ -O2 pc_send/rpi_streamer_linux.cpp -lpulse -lpulse-simple -pthread -o pc_send/rpi_streamer_linux

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Hi-Fi RPi CD Player</title>
+    <meta name="description" content="Reproduce CDs en alta fidelidad desde tu Raspberry Pi">
+    <meta name="theme-color" content="#0a0a0c">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="CD Player">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Dynamic backdrop gradient blobs for glassmorphism effect -->
+    <div class="bg-blob blob-1"></div>
+    <div class="bg-blob blob-2"></div>
+    <div class="bg-blob blob-3"></div>
+
+    <div class="container">
+        <!-- Main Player Panel -->
+        <main class="player-card">
+            <!-- Header: DAC & Buffer selectors -->
+            <header class="player-header">
+                <div class="dac-selector-area">
+                    <select id="dac-select" class="dac-select" title="Seleccionar salida de audio">
+                        <option value="default">Cargando salidas...</option>
+                    </select>
+                    <select id="buffer-select" class="dac-select" title="Tamaño del búfer de audio">
+                        <option value="100">Búfer: 100 ms</option>
+                        <option value="250">Búfer: 250 ms</option>
+                        <option value="500">Búfer: 500 ms</option>
+                        <option value="1000">Búfer: 1 s</option>
+                        <option value="2500" selected>Búfer: 2.5 s (Recomendado)</option>
+                        <option value="5000">Búfer: 5 s</option>
+                    </select>
+                </div>
+            </header>
+
+            <!-- Playback Status & Vinyl/CD Art -->
+            <section class="player-body">
+                <div class="cd-visual-container">
+                    <div id="cd-disc" class="cd-disc">
+                        <div class="cd-label">
+                            <span id="cd-status-text" class="status">DETENIDO</span>
+                            <div class="center-hole"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="track-meta">
+                    <h1 id="current-track-title">Sin Disco</h1>
+                    <p id="current-track-subtitle">Inserta un CD para comenzar</p>
+                    
+                    <!-- Progress Bar / Time Tracker -->
+                    <div class="progress-container">
+                        <span id="time-elapsed" class="time-label">00:00</span>
+                        <div id="progress-bar-bg" class="progress-bar-bg" style="cursor: pointer;">
+                            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+                        </div>
+                        <span id="track-total-time" class="time-label">00:00</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Transport & Tray Controls -->
+            <section class="player-controls">
+                <!-- Primary Transport Controls -->
+                <div class="transport-group">
+                    <button id="btn-prev" class="control-btn" title="Pista Anterior" aria-label="Pista anterior">
+                        <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6L18 6v12z"/></svg>
+                    </button>
+                    
+                    <button id="btn-play-pause" class="control-btn play-btn" title="Reproducir / Pausar" aria-label="Reproducir o pausar">
+                        <svg id="play-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                        <svg id="pause-icon" viewBox="0 0 24 24" class="hidden"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                    </button>
+
+                    <button id="btn-stop" class="control-btn" title="Detener" aria-label="Detener">
+                        <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+                    </button>
+
+                    <button id="btn-next" class="control-btn" title="Siguiente Pista" aria-label="Siguiente pista">
+                        <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6zm9-12v12h2V6z"/></svg>
+                    </button>
+                </div>
+
+                <!-- Tray & Disc Actions -->
+                <div class="action-group">
+                    <button id="btn-load" class="action-btn" title="Cerrar Bandeja">
+                        Cargar CD
+                    </button>
+                    <button id="btn-eject" class="action-btn danger" title="Abrir Bandeja / Expulsar">
+                        Expulsar
+                    </button>
+                    <button id="btn-refresh" class="action-btn secondary" title="Volver a escanear pistas">
+                        Escanear CD
+                    </button>
+                    <button id="btn-lookup" class="action-btn secondary" title="Identificar el disco automáticamente usando MusicBrainz">
+                        🔍 Identificar Disco
+                    </button>
+                    <button id="btn-pc-audio" class="action-btn secondary" title="Escuchar sonido del ordenador">
+                        Compartir Audio PC
+                    </button>
+                    <button id="btn-bluetooth" class="action-btn secondary" title="Modo Bluetooth LDAC / Bit-Perfect">
+                        ᛒ Bluetooth LDAC
+                    </button>
+                </div>
+            </section>
+        </main>
+
+        <!-- Tracklist Panel -->
+        <aside class="tracklist-card">
+            <h2>Pistas del Disco</h2>
+            <div id="tracklist-container" class="tracklist-list">
+                <div class="no-tracks-message">
+                    No se han detectado pistas. Inserta un CD y presiona "Escanear CD".
+                </div>
+            </div>
+        </aside>
+
+        <!-- Dynamic Module Slots (Mods inject their UI here) -->
+        <div id="module-slot-dashboard" style="grid-column: 1 / -1; display: flex; flex-direction: column; gap: 1rem;"></div>
+
+        <!-- Modular Extensions Panel (Like Game Mods) -->
+        <section class="tracklist-card" style="grid-column: 1 / -1; margin-top: 1rem;">
+            <div style="margin-bottom: 1rem;">
+                <h2 style="margin: 0; font-size: 1.15rem; display: flex; align-items: center; gap: 0.5rem; color: #fab387;">
+                    🧩 Extensiones y Módulos
+                </h2>
+                <p style="margin: 0.25rem 0 0 0; font-size: 0.85rem; color: #a6adc8;">
+                    Módulos instalados en la carpeta <code>modules/</code>. Cada mod añade funcionalidades avanzadas cuando se activa.
+                </p>
+            </div>
+            <div id="modules-list" style="display: flex; flex-direction: column; gap: 0.75rem;">
+                <div style="color: #6c7086; font-size: 0.9rem; font-style: italic;">Cargando módulos instalados...</div>
+            </div>
+        </section>
+    </div>
+
+    <!-- ====== MusicBrainz Lookup Modal ====== -->
+    <div id="lookup-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2 id="modal-title">🔍 Identificar Disco</h2>
+                <button id="modal-close" class="modal-close-btn" aria-label="Cerrar">&times;</button>
+            </div>
+
+            <!-- Loading state -->
+            <div id="modal-loading" class="modal-section">
+                <div class="spinner"></div>
+                <p>Consultando MusicBrainz...</p>
+            </div>
+
+            <!-- Error state -->
+            <div id="modal-error" class="modal-section hidden">
+                <p id="modal-error-msg" class="modal-error-text"></p>
+            </div>
+
+            <!-- Results -->
+            <div id="modal-results" class="modal-section hidden">
+                <p class="modal-hint">Selecciona la edición correcta del disco:</p>
+                <div id="modal-releases-list" class="releases-list"></div>
+            </div>
+
+            <!-- Manual edit -->
+            <div id="modal-manual" class="modal-section">
+                <details id="manual-details">
+                    <summary>✏️ Edición manual de metadatos</summary>
+                    <div class="manual-fields">
+                        <label>Título del álbum
+                            <input id="manual-album" type="text" placeholder="Título del álbum" />
+                        </label>
+                        <label>Artista
+                            <input id="manual-artist" type="text" placeholder="Artista" />
+                        </label>
+                        <label>URL de portada
+                            <input id="manual-cover" type="text" placeholder="https://..." />
+                        </label>
+                        <button id="btn-apply-manual" class="action-btn">Aplicar manual</button>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

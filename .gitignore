@@ -1,0 +1,25 @@
+android_app/app/build/
+android_app/build/
+android_app/.gradle/
+android_app/local.properties
+*.hprof
+
+# Binarios compilados (PyInstaller / cx_Freeze / C)
+pc_send/pc_audio_sender
+pc_send/dist/
+pc_send/build/
+modules/cisco_voip/cisco_gateway
+*.spec
+*.so
+*.o
+release-assets/
+
+# Python cache y logs
+__pycache__/
+*.pyc
+*.pyo
+main.log
+touch-panel/config.json
+.env
+android_app/.kotlin/
+.graphify/

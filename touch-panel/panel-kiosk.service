@@ -1,0 +1,28 @@
+[Unit]
+Description=Touch Panel Kiosk (Cage + Cog)
+After=panel.service getty@tty1.service
+Wants=panel.service
+Conflicts=getty@tty1.service
+ConditionPathExists=/dev/dri/card0
+
+[Service]
+Type=simple
+User=root
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=XCURSOR_THEME=transparent
+Environment=XCURSOR_SIZE=1
+Environment=WLR_NO_HARDWARE_CURSORS=1
+ExecStart=/home/guille/panel/start-kiosk.sh
+Restart=always
+RestartSec=5
+
+# Isolate UI Rendering Engine (Cage + Cog) to CPU Cores 0 & 1
+CPUAffinity=0 1
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

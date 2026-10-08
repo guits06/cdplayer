@@ -1,0 +1,17 @@
+{
+  "id": "cisco_voip",
+  "name": "Cisco 7940 VoIP Gateway",
+  "version": "1.0.0",
+  "description": "SIP/RTP VoIP bridge, PBAP contact synchronization, and web monitor for Cisco 7940 over Bluetooth.",
+  "author": "Guille",
+  "icon": "phone",
+  "capabilities": [
+    "telephony"
+  ],
+  "service": "cisco-gateway",
+  "web": {
+    "enabled": true,
+    "port": 8088,
+    "label": "Web Monitor"
+  }
+}

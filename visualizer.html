@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Hi-Fi Visualizer - RPi CD Player</title>
+    
+    <!-- iOS PWA Compatibility -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Visualizer">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#070709">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <link rel="manifest" href="manifest-visualizer.json">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #070709;
+            --accent-glow: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --text-primary: #ffffff;
+            --text-secondary: rgba(255, 255, 255, 0.65);
+            --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background-color: var(--bg-dark);
+            font-family: var(--font-sans);
+            color: var(--text-primary);
+            user-select: none;
+        }
+
+        /* Ambient Blurred Album Cover Backdrop */
+        .ambient-bg {
+            position: absolute;
+            inset: -40px;
+            background-size: cover;
+            background-position: center;
+            filter: blur(80px) brightness(0.35) saturate(1.4);
+            transform: scale(1.1);
+            transition: background-image 1s ease-in-out;
+            z-index: 1;
+        }
+
+        .ambient-overlay {
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at center, rgba(7, 7, 9, 0.4) 0%, rgba(7, 7, 9, 0.9) 100%);
+            z-index: 2;
+        }
+
+        /* Main Fullscreen Visualizer Layout */
+        .visualizer-stage {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            padding: 40px 20px;
+        }
+
+        /* Header Info Badge */
+        .stage-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-badge {
+            background: rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 8px 18px;
+            border-radius: 30px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-glow);
+            box-shadow: 0 0 10px var(--accent-glow);
+            animation: pulse-dot 2s infinite alternate;
+        }
+
+        @keyframes pulse-dot {
+            0% { transform: scale(0.8); opacity: 0.6; }
+            100% { transform: scale(1.3); opacity: 1; }
+        }
+
+        /* Center Spinning Disc Visualization */
+        .stage-center {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex-grow: 1;
+            width: 100%;
+            gap: 30px;
+        }
+
+        .disc-wrapper {
+            position: relative;
+            width: min(340px, 45vh);
+            height: min(340px, 45vh);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .vinyl-disc {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: radial-gradient(circle, #1a1a1e 15%, #0d0d10 25%, #2a2a30 45%, #050507 65%, #1a1a1e 70%);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8), inset 0 0 30px rgba(255, 255, 255, 0.08);
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transform: rotate(0deg);
+            transition: transform 0.5s ease-out;
+        }
+
+        .vinyl-disc.spinning {
+            animation: spinVinyl 4s linear infinite;
+        }
+
+        @keyframes spinVinyl {
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Vinyl Grooves */
+        .vinyl-disc::before {
+            content: '';
+            position: absolute;
+            inset: 6%;
+            border-radius: 50%;
+            background: repeating-radial-gradient(circle, transparent 0, transparent 4px, rgba(255, 255, 255, 0.02) 5px, transparent 6px);
+            pointer-events: none;
+        }
+
+        /* Center Cover Artwork Label */
+        .disc-label {
+            width: 52%;
+            height: 52%;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #1d4ed8 0%, #7c3aed 100%);
+            background-size: cover;
+            background-position: center;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+            overflow: hidden;
+            transition: background-image 0.5s ease;
+        }
+
+        .disc-hole {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background-color: var(--bg-dark);
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            position: absolute;
+            box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.9);
+        }
+
+        /* Animated Equalizer Wave Bars */
+        .equalizer-bars {
+            display: flex;
+            align-items: flex-end;
+            gap: 6px;
+            height: 35px;
+        }
+
+        .eq-bar {
+            width: 6px;
+            background: linear-gradient(180deg, var(--accent-purple) 0%, var(--accent-glow) 100%);
+            border-radius: 3px;
+            height: 6px;
+            transition: height 0.15s ease;
+        }
+
+        .equalizer-bars.active .eq-bar {
+            animation: eqAnim 1.2s ease-in-out infinite alternate;
+        }
+
+        .eq-bar:nth-child(1) { animation-delay: 0.1s; }
+        .eq-bar:nth-child(2) { animation-delay: 0.3s; }
+        .eq-bar:nth-child(3) { animation-delay: 0.5s; }
+        .eq-bar:nth-child(4) { animation-delay: 0.2s; }
+        .eq-bar:nth-child(5) { animation-delay: 0.4s; }
+
+        @keyframes eqAnim {
+            0% { height: 6px; }
+            100% { height: 35px; }
+        }
+
+        /* Track Metadata Display */
+        .stage-footer {
+            width: 100%;
+            max-width: 750px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            text-align: center;
+        }
+
+        .track-title {
+            font-size: clamp(1.8rem, 4vw, 3rem);
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            line-height: 1.1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+            text-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+        }
+
+        .artist-album {
+            font-size: clamp(1rem, 2vw, 1.4rem);
+            color: var(--text-secondary);
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+
+        /* Smooth Progress Line */
+        .progress-bar-wrap {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-top: 6px;
+        }
+
+        .time-txt {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+            width: 50px;
+        }
+
+        .progress-track {
+            flex-grow: 1;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 3px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--accent-glow) 0%, var(--accent-purple) 100%);
+            box-shadow: 0 0 12px var(--accent-glow);
+            border-radius: 3px;
+            transition: width 0.4s linear;
+        }
+
+        /* Fullscreen Helper Overlay */
+        .fs-btn {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 600;
+            z-index: 20;
+            backdrop-filter: blur(10px);
+            transition: opacity 0.5s ease, background 0.2s ease;
+        }
+
+        .fs-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        body.idle-cursor .fs-btn {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        body.idle-cursor {
+            cursor: none;
+        }
+    </style>
+</head>
+<body>
+    <!-- Background Ambient Blur -->
+    <div id="ambient-bg" class="ambient-bg"></div>
+    <div class="ambient-overlay"></div>
+
+    <div class="visualizer-stage">
+        <!-- Center Spinning CD -->
+        <main class="stage-center">
+            <div class="disc-wrapper">
+                <div id="vinyl-disc" class="vinyl-disc">
+                    <div id="disc-label" class="disc-label">
+                        <div class="disc-hole"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Client-Side Zero-CPU Audio Equalizer -->
+            <div id="equalizer" class="equalizer-bars">
+                <div class="eq-bar"></div>
+                <div class="eq-bar"></div>
+                <div class="eq-bar"></div>
+                <div class="eq-bar"></div>
+                <div class="eq-bar"></div>
+            </div>
+        </main>
+
+        <!-- Track Info & Progress -->
+        <footer class="stage-footer">
+            <h1 id="track-title" class="track-title">Cargando reproductor...</h1>
+            <h2 id="artist-album" class="artist-album">Hi-Fi RPi CD Player</h2>
+
+            <div class="progress-bar-wrap">
+                <span id="time-cur" class="time-txt">00:00</span>
+                <div class="progress-track">
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+                <span id="time-total" class="time-txt">00:00</span>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        // Visualizer Client Script - Supports both relative /api/status (reverse proxy/domain) & port 8000 fallback
+        const ambientBg = document.getElementById("ambient-bg");
+        const statusText = document.getElementById("status-text");
+        const statusDot = document.getElementById("status-dot");
+        const vinylDisc = document.getElementById("vinyl-disc");
+        const discLabel = document.getElementById("disc-label");
+        const equalizer = document.getElementById("equalizer");
+
+        const trackTitle = document.getElementById("track-title");
+        const artistAlbum = document.getElementById("artist-album");
+        const timeCur = document.getElementById("time-cur");
+        const timeTotal = document.getElementById("time-total");
+        const progressFill = document.getElementById("progress-fill");
+        const fsBtn = document.getElementById("fs-btn");
+
+        let currentCover = "";
+
+        // Screen Wake Lock Manager for Visualizer PWA
+        let wakeLockSentinel = null;
+        async function enableScreenWakeLock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    if (!wakeLockSentinel || wakeLockSentinel.released) {
+                        wakeLockSentinel = await navigator.wakeLock.request('screen');
+                        console.log('[Visualizer] Screen Wake Lock activado.');
+                    }
+                }
+            } catch (err) {
+                console.log('[Visualizer] Wake Lock info:', err);
+            }
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                enableScreenWakeLock();
+            }
+        });
+
+        ['click', 'touchstart'].forEach(evt => {
+            document.addEventListener(evt, enableScreenWakeLock, { once: true });
+        });
+
+        function formatTime(secs) {
+            if (isNaN(secs) || secs < 0) return "00:00";
+            const m = Math.floor(secs / 60);
+            const s = Math.floor(secs % 60);
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+
+        async function pollStatus() {
+            try {
+                let res;
+                try {
+                    res = await fetch('/api/status');
+                    if (!res.ok) throw new Error("Relative API failed");
+                } catch (e) {
+                    const fallbackUrl = 'http://' + window.location.hostname + ':8000/api/status';
+                    res = await fetch(fallbackUrl);
+                }
+                if (!res.ok) throw new Error("API error");
+                const data = await res.json();
+                updateVisualizer(data);
+            } catch (err) {
+                if (statusText) statusText.textContent = "CONEXIÓN PERDIDA";
+                if (statusDot) statusDot.style.backgroundColor = "var(--accent-purple)";
+                equalizer.classList.remove("active");
+                vinylDisc.classList.remove("spinning");
+            }
+        }
+
+        function updateVisualizer(data) {
+            // Update Cover Art
+            if (data.cover_url && data.cover_url !== currentCover) {
+                currentCover = data.cover_url;
+                ambientBg.style.backgroundImage = `url("${currentCover}")`;
+                discLabel.style.backgroundImage = `url("${currentCover}")`;
+            } else if (!data.cover_url) {
+                currentCover = "";
+                ambientBg.style.backgroundImage = "";
+                discLabel.style.backgroundImage = "";
+            }
+
+            // Mode / Status
+            if (data.pc_audio_active) {
+                if (statusText) statusText.textContent = "COMPARTIENDO PC AUDIO";
+                if (statusDot) statusDot.style.backgroundColor = "#10b981";
+                vinylDisc.classList.remove("spinning");
+                equalizer.classList.add("active");
+                trackTitle.textContent = "Audio Compartido del PC";
+                artistAlbum.textContent = "Transmisión PCM 16-bit / 48kHz en streaming";
+                timeCur.textContent = "--:--";
+                timeTotal.textContent = "--:--";
+                progressFill.style.width = "0%";
+            } else if (data.state === "playing") {
+                enableScreenWakeLock();
+                if (statusText) statusText.textContent = "REPRODUCIENDO CD";
+                if (statusDot) statusDot.style.backgroundColor = "#3b82f6";
+                vinylDisc.classList.add("spinning");
+                equalizer.classList.add("active");
+
+                const activeTrack = (data.tracks || []).find(t => t.track === data.current_track);
+                if (activeTrack) {
+                    trackTitle.textContent = activeTrack.title || `Pista ${activeTrack.track}`;
+                    const art = data.artist_name || "Artista Desconocido";
+                    const alb = data.album_title || "Álbum Desconocido";
+                    artistAlbum.textContent = `${art} — ${alb}`;
+
+                    const elapsed = data.elapsed_time || 0;
+                    const total = activeTrack.duration || 1;
+                    timeCur.textContent = formatTime(elapsed);
+                    timeTotal.textContent = activeTrack.formatted_duration || formatTime(total);
+                    const pct = Math.min(100, (elapsed / total) * 100);
+                    progressFill.style.width = `${pct}%`;
+                }
+            } else if (data.state === "paused") {
+                if (statusText) statusText.textContent = "EN PAUSA";
+                if (statusDot) statusDot.style.backgroundColor = "#f59e0b";
+                vinylDisc.classList.remove("spinning");
+                equalizer.classList.remove("active");
+            } else if (data.state === "no_disc") {
+                if (statusText) statusText.textContent = "SIN DISCO";
+                if (statusDot) statusDot.style.backgroundColor = "#ef4444";
+                vinylDisc.classList.remove("spinning");
+                equalizer.classList.remove("active");
+                trackTitle.textContent = "Sin Disco Insertado";
+                artistAlbum.textContent = "Inserta un CD de música para comenzar";
+                timeCur.textContent = "00:00";
+                timeTotal.textContent = "00:00";
+                progressFill.style.width = "0%";
+            } else {
+                if (statusText) statusText.textContent = "DETENIDO";
+                if (statusDot) statusDot.style.backgroundColor = "#6b7280";
+                vinylDisc.classList.remove("spinning");
+                equalizer.classList.remove("active");
+                trackTitle.textContent = data.album_title || "CD de Música";
+                artistAlbum.textContent = data.artist_name || "Listo para reproducir";
+                timeCur.textContent = "00:00";
+                timeTotal.textContent = "00:00";
+                progressFill.style.width = "0%";
+            }
+        }
+
+        // Poll every 800ms
+        setInterval(pollStatus, 800);
+        pollStatus();
+
+        // Fullscreen toggle
+        function toggleFS() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            } else {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+
+        fsBtn.addEventListener("click", toggleFS);
+        window.addEventListener("keydown", (e) => {
+            if (e.key === "f" || e.key === "F") toggleFS();
+        });
+
+        // Hide cursor after inactivity
+        let idleTimer;
+        window.addEventListener("mousemove", () => {
+            document.body.classList.remove("idle-cursor");
+            clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+                document.body.classList.add("idle-cursor");
+            }, 3000);
+        });
+
+        // Register Service Worker for iOS PWA installation
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw-visualizer.js').catch(() => {});
+            });
+        }
+    </script>
+</body>
+</html>

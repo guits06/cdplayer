@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>RPi CD Player</title>
+  <link rel="stylesheet" href="style.css?v=3">
+</head>
+<body>
+  <div id="app-container">
+    <header>
+      <div class="header-title" id="header-title">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        <span id="header-text">CD Player</span>
+      </div>
+      <div class="header-dots" id="header-dots" style="display: none;"></div>
+    </header>
+
+    <main id="viewport">
+      <div class="page active" id="page-0"></div>
+    </main>
+  </div>
+
+  <!-- Page Module -->
+  <script src="pages/cdplayer.js?v=3"></script>
+
+  <!-- Core Router -->
+  <script src="app.js?v=3"></script>
+</body>
+</html>
+

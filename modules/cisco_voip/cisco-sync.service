@@ -1,0 +1,16 @@
+[Unit]
+Description=Cisco PBAP Contact Sync & Bluetooth Mobile Monitor
+After=bluetooth.service
+PartOf=cisco-gateway.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'pgrep -f "obexd -s" || /usr/libexec/bluetooth/obexd -s -a -r /tmp &'
+ExecStart=/usr/bin/python3 -u /usr/local/bin/cisco_sync.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=cisco-gateway.service

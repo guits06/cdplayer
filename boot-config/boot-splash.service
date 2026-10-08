@@ -1,0 +1,21 @@
+[Unit]
+Description=CDPlayer Boot Splash
+DefaultDependencies=no
+After=systemd-vconsole-setup.service
+Before=sysinit.target network.target
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boot-splash.sh
+ExecStop=/usr/local/bin/boot-splash-clear.sh
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=no
+Restart=no
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=sysinit.target

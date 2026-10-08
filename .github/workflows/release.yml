@@ -1,0 +1,63 @@
+name: Release Desktop Audio Streamer
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release Assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++ \
+            g++-mingw-w64-x86-64 \
+            libpulse-dev
+
+      - name: Prepare Release Directory
+        run: mkdir -p release-assets
+
+      - name: Build Linux Streamer Binary
+        run: |
+          g++ -O3 -s pc_send/rpi_streamer_linux.cpp \
+            -lpulse -lpulse-simple -pthread \
+            -o release-assets/rpi_streamer_linux
+          chmod +x release-assets/rpi_streamer_linux
+
+      - name: Build Windows Streamer Binary (x86_64)
+        run: |
+          x86_64-w64-mingw32-g++ -O3 -s -std=c++17 -static \
+            pc_send/rpi_streamer_windows.cpp \
+            -o release-assets/rpi_streamer_windows.exe \
+            -lws2_32 -lole32 -lwinmm
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          name: ${{ github.ref_type == 'tag' && format('RPi Audio Streamer {0}', github.ref_name) || 'RPi Audio Streamer (Latest)' }}
+          body: |
+            Standalone high-resolution desktop audio stream clients for Raspberry Pi CD Player:
+
+            - `rpi_streamer_windows.exe`: Native Windows WASAPI Loopback client (lossless 24-bit/48kHz RTP stream).
+            - `rpi_streamer_linux`: Native Linux PulseAudio/PipeWire client.
+          draft: false
+          prerelease: false
+          files: |
+            release-assets/rpi_streamer_windows.exe
+            release-assets/rpi_streamer_linux

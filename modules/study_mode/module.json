@@ -1,0 +1,17 @@
+{
+  "id": "study_mode",
+  "name": "Study Mode",
+  "version": "1.0.0",
+  "description": "Productivity tools: Pomodoro timer, full-screen flip clock, LoFi stream, and white noise ambience.",
+  "author": "Guille",
+  "icon": "study",
+  "capabilities": [
+    "study"
+  ],
+  "backend": "study_backend.py",
+  "ui": {
+    "slot": "dashboard",
+    "html": "ui.html",
+    "js": "ui.js"
+  }
+}
