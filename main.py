@@ -18,7 +18,21 @@ import ctypes
 import shutil
 import base64
 
+# Registrar este módulo como 'main' en sys.modules para evitar que 'import main'
+# desde plugins (ej. study_backend.py) vuelva a ejecutar main.py desde cero.
+sys.modules["main"] = sys.modules[__name__]
 
+# Rotación preventiva de main.log al arrancar si supera 2 MB
+try:
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.log")
+    if os.path.isfile(_log_path) and os.path.getsize(_log_path) > 2 * 1024 * 1024:
+        with open(_log_path, "rb") as _lf:
+            _lf.seek(-512 * 1024, os.SEEK_END)
+            _tail = _lf.read()
+        with open(_log_path, "wb") as _lf:
+            _lf.write(b"--- [LOG TRUNCATED AT STARTUP] ---\n" + _tail)
+except Exception:
+    pass
 
 # Forzar idioma inglés (C) en todos los subprocesos (setcd, cdparanoia, etc)
 # para que el parseo de texto (ej. "No disc is inserted") funcione correctamente
@@ -116,8 +130,9 @@ class ModuleManager:
                 except Exception as e:
                     print(f"[Modules] Error loading manifest for '{entry}': {e}", flush=True)
 
-    def list_modules(self):
-        self.discover_modules()
+    def list_modules(self, refresh=False):
+        if refresh or not self.modules:
+            self.discover_modules()
         res = []
         for mod_id, m in self.modules.items():
             res.append({
@@ -325,6 +340,11 @@ class PlayerState:
         self.study_audio_proc = None
         self.study_lofi_proc = None
         self.aux_volume = 80
+        self.last_eject_time = 0.0
+
+    def stop_cd_playback(self):
+        with self.lock:
+            stop_playback_unsafe()
 
     @property
     def voip_module_enabled(self):
@@ -340,7 +360,9 @@ class PlayerState:
             if self.tracks and self.current_track <= len(self.tracks):
                 cur_dur = self.tracks[self.current_track - 1].get("duration", 0)
 
-            if self.state == "playing" and self.play_start_time > 0:
+            if HAS_NATIVE_ENGINE:
+                elapsed = self.bytes_played / 176400.0
+            elif self.state == "playing" and self.play_start_time > 0:
                 elapsed = max(0.0, (time.time() - self.play_start_time) + self.seek_offset_time)
                 if cur_dur > 0:
                     elapsed = min(elapsed, float(cur_dur))
@@ -508,6 +530,12 @@ def detect_usb_dac():
 
 
 CDROM_SELECT_SPEED = 0x5322
+CDROM_DRIVE_STATUS = 0x5326
+CDROM_LOCKDOOR = 0x5329
+CDS_NO_DISC = 1
+CDS_TRAY_OPEN = 2
+CDS_DRIVE_NOT_READY = 3
+CDS_DISC_OK = 4
 
 def set_drive_speed(speed=2):
     """Clamps hardware drive speed to safe threshold (default 2x = 300 KB/s).
@@ -517,11 +545,19 @@ def set_drive_speed(speed=2):
     if not os.path.exists(dev):
         return
 
-    # 1. Direct Linux CD-ROM MMC ioctl
+    # 1. Direct Linux CD-ROM MMC ioctl + ensure manual eject button is unlocked
     try:
         fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
-        fcntl.ioctl(fd, CDROM_SELECT_SPEED, speed)
+        try:
+            fcntl.ioctl(fd, CDROM_LOCKDOOR, 0)
+        except Exception:
+            pass
+        try:
+            fcntl.ioctl(fd, CDROM_SELECT_SPEED, speed)
+        except Exception:
+            pass
         os.close(fd)
+        return
     except Exception:
         pass
 
@@ -533,11 +569,36 @@ def set_drive_speed(speed=2):
 
 
 def check_cd_inserted(current_presence=False):
-    """Checks if a CD is inserted using setcd."""
+    """Checks if a CD is inserted using kernel CDROM_DRIVE_STATUS ioctl with setcd fallback."""
     try:
         dev = get_cd_device()
         if not os.path.exists(dev):
             return False
+
+        # 1. Fast non-blocking kernel ioctl (< 1ms, no subprocess overhead)
+        try:
+            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                st = fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
+                if st == CDS_DISC_OK:
+                    return True
+                if st in (CDS_NO_DISC, CDS_TRAY_OPEN):
+                    if current_presence:
+                        # Debounce transient bus glitch before confirming disc ejection
+                        time.sleep(0.1)
+                        st2 = fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0)
+                        if st2 == CDS_DISC_OK:
+                            return True
+                    return False
+                if st == CDS_DRIVE_NOT_READY:
+                    # Drive is spinning up or transitioning; preserve previous known state
+                    return current_presence
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+
+        # 2. Fallback to setcd -i
         res = subprocess.run(["setcd", "-i", dev], capture_output=True, text=True, timeout=3)
         out_lower = (res.stdout + res.stderr).lower()
         if "disc found" in out_lower:
@@ -545,15 +606,58 @@ def check_cd_inserted(current_presence=False):
         if "no disc is inserted" in out_lower or "tray is open" in out_lower:
             return False
         if "drive is not ready" in out_lower:
-            # Drive is in standby with disc inside (or spinning up)
-            return True
+            return current_presence
         return current_presence
     except Exception:
         return current_presence
 
 
+def auto_enrich_musicbrainz(expected_leadout):
+    """Background helper: queries MusicBrainz when a CD lacks CD-TEXT and auto-applies
+    metadata + cover art if a high-confidence TOC duration match is found."""
+    try:
+        res = musicbrainz_lookup()
+        releases = res.get("releases", [])
+        if not releases:
+            return
+        best = releases[0]
+        with state.lock:
+            if state.toc_leadout != expected_leadout or not state.tracks:
+                return
+            # Only auto-apply if album_title is still empty
+            if state.album_title:
+                return
+            num_tracks = len(state.tracks)
+            max_allowed_diff = max(15, num_tracks * 4)
+            if best.get("duration_diff", 9999) > max_allowed_diff and len(releases) > 1:
+                print(f"[MusicBrainz] Mejor candidato '{best.get('title')}' supera umbral de diferencia ({best.get('duration_diff')}s > {max_allowed_diff}s).", flush=True)
+                return
+
+            state.album_title = best.get("title", "") or state.album_title
+            state.album_artist = best.get("artist", "") or state.album_artist
+            state.cover_url = best.get("cover_url", "") or state.cover_url
+            mb_tracks = {t["track"]: t for t in best.get("tracks", [])}
+            for tr in state.tracks:
+                tn = tr["track"]
+                if tn in mb_tracks:
+                    mb_t = mb_tracks[tn]
+                    if mb_t.get("title"):
+                        tr["title"] = mb_t["title"]
+                        if HAS_NATIVE_ENGINE:
+                            try:
+                                cdda.cdda_set_track_title(tn, tr["title"].encode("utf-8")[:127])
+                            except Exception:
+                                pass
+                    if mb_t.get("artist"):
+                        tr["artist"] = mb_t["artist"]
+            print(f"[MusicBrainz] Metadatos aplicados automáticamente: {state.album_artist} - {state.album_title} (diff={best.get('duration_diff')}s)", flush=True)
+    except Exception as e:
+        print(f"[MusicBrainz] Error en auto-enriquecimiento: {e}", flush=True)
+
+
 def get_track_list():
-    """Parses track list with native C engine (instantaneous), enriched with CD-Text and MusicBrainz."""
+    """Parses track list with native C engine (instantaneous, including native SCSI CD-TEXT),
+    with fallback to cd-info and automatic background MusicBrainz enrichment."""
     dev = get_cd_device()
     if not os.path.exists(dev):
         return []
@@ -567,7 +671,7 @@ def get_track_list():
     album_artist = ""
     album_title = ""
 
-    # 1. Native C Engine TOC read (< 5 milliseconds)
+    # 1. Native C Engine TOC + CD-TEXT read (< 10 milliseconds)
     if HAS_NATIVE_ENGINE:
         try:
             try:
@@ -578,16 +682,27 @@ def get_track_list():
             count = cdda.cdda_read_disc_info(ctypes.byref(info))
             if count > 0:
                 leadout_lba = info.leadout_lba
+                c_album = info.album_title.decode("utf-8", errors="replace").strip()
+                c_artist = info.album_artist.decode("utf-8", errors="replace").strip()
+                if c_album and c_album != "Audio CD":
+                    album_title = c_album
+                if c_artist and c_artist != "Unknown Artist":
+                    album_artist = c_artist
+
                 for i in range(count):
                     t = info.tracks[i]
                     dur = t.duration_sec
                     mins = dur // 60
                     secs = dur % 60
+                    t_title = t.title.decode("utf-8", errors="replace").strip()
+                    t_artist = t.artist.decode("utf-8", errors="replace").strip()
+                    if not t_title or t_title.startswith("Track "):
+                        t_title = f"Pista {t.track_num}"
                     raw_entries.append((t.track_num, t.start_lba))
                     tracks.append({
                         "track": t.track_num,
-                        "title": f"Pista {t.track_num}",
-                        "artist": "",
+                        "title": t_title,
+                        "artist": t_artist,
                         "start_lba": t.start_lba,
                         "start_sec": float(t.start_lba / 75.0),
                         "total_sectors": t.total_sectors,
@@ -595,51 +710,50 @@ def get_track_list():
                         "formatted_duration": f"{mins:02d}:{secs:02d}"
                     })
                 if raw_entries:
-                    state.toc_offsets = raw_entries
-                    state.toc_leadout = leadout_lba
+                    with state.lock:
+                        state.toc_offsets = raw_entries
+                        state.toc_leadout = leadout_lba
         except Exception as e:
             print(f"Notice: C engine TOC read exception: {e}", flush=True)
 
-    # 2. CD-Text enrichment via safe non-probing cd-info scan
-    track_titles = {}
-    track_performers = {}
+    # 2. Fallback to cd-info ONLY if native C engine did not populate tracks
+    if not tracks:
+        track_titles = {}
+        track_performers = {}
+        try:
+            res = subprocess.run(
+                ["cd-info", "--no-device-info", "--no-disc-mode", "--no-analyze", "-T", "-C", dev],
+                capture_output=True, text=True, timeout=4
+            )
+            lines = res.stdout.splitlines()
+            current_track_idx = None
+            in_cdtext = False
 
-    try:
-        res = subprocess.run(
-            ["cd-info", "--no-device-info", "--no-disc-mode", "--no-analyze", "-C", dev],
-            capture_output=True, text=True, timeout=5
-        )
-        lines = res.stdout.splitlines()
-        current_track_idx = None
-        in_cdtext = False
+            for line in lines:
+                line_str = line.strip()
+                if line_str.startswith("CD-TEXT for Disc:"):
+                    in_cdtext = True
+                    continue
+                m_tr_title = re.search(r"CD-TEXT for Track\s+(\d+):", line_str)
+                if m_tr_title:
+                    current_track_idx = int(m_tr_title.group(1))
+                    continue
+                if in_cdtext:
+                    m_title = re.search(r"TITLE:\s*(.*)", line_str)
+                    if m_title:
+                        val = m_title.group(1).strip()
+                        if current_track_idx is not None:
+                            track_titles[current_track_idx] = val
+                        elif not album_title:
+                            album_title = val
+                    m_perf = re.search(r"PERFORMER:\s*(.*)", line_str)
+                    if m_perf:
+                        val = m_perf.group(1).strip()
+                        if current_track_idx is not None:
+                            track_performers[current_track_idx] = val
+                        elif not album_artist:
+                            album_artist = val
 
-        for line in lines:
-            line_str = line.strip()
-            if line_str.startswith("CD-TEXT for Disc:"):
-                in_cdtext = True
-                continue
-            m_tr_title = re.search(r"CD-TEXT for Track\s+(\d+):", line_str)
-            if m_tr_title:
-                current_track_idx = int(m_tr_title.group(1))
-                continue
-            if in_cdtext:
-                m_title = re.search(r"TITLE:\s*(.*)", line_str)
-                if m_title:
-                    val = m_title.group(1).strip()
-                    if current_track_idx is not None:
-                        track_titles[current_track_idx] = val
-                    elif not album_title:
-                        album_title = val
-                m_perf = re.search(r"PERFORMER:\s*(.*)", line_str)
-                if m_perf:
-                    val = m_perf.group(1).strip()
-                    if current_track_idx is not None:
-                        track_performers[current_track_idx] = val
-                    elif not album_artist:
-                        album_artist = val
-
-            # Fallback parse LSN table if C engine didn't populate tracks
-            if not tracks:
                 m_lsn = re.match(r"\s*(\d+):\s+[\d:]+\s+(\d+)\s+(audio|leadout)", line)
                 if m_lsn:
                     t_num = int(m_lsn.group(1))
@@ -650,44 +764,38 @@ def get_track_list():
                     elif t_type == "leadout" or t_num >= 100:
                         leadout_lba = lba
 
-        if not tracks and raw_entries:
-            for i in range(len(raw_entries)):
-                t_num, start_lba = raw_entries[i]
-                next_lba = raw_entries[i+1][1] if i + 1 < len(raw_entries) else leadout_lba
-                total_sectors = max(75, next_lba - start_lba)
-                duration = int(total_sectors / 75.0)
-                mins = duration // 60
-                secs = duration % 60
-                tracks.append({
-                    "track": t_num,
-                    "title": f"Pista {t_num}",
-                    "artist": "",
-                    "start_lba": start_lba,
-                    "start_sec": float(start_lba / 75.0),
-                    "total_sectors": total_sectors,
-                    "duration": duration,
-                    "formatted_duration": f"{mins:02d}:{secs:02d}"
-                })
-            state.toc_offsets = raw_entries
-            state.toc_leadout = leadout_lba
+            if raw_entries:
+                for i in range(len(raw_entries)):
+                    t_num, start_lba = raw_entries[i]
+                    next_lba = raw_entries[i+1][1] if i + 1 < len(raw_entries) else leadout_lba
+                    total_sectors = max(75, next_lba - start_lba)
+                    duration = int(total_sectors / 75.0)
+                    mins = duration // 60
+                    secs = duration % 60
+                    tracks.append({
+                        "track": t_num,
+                        "title": track_titles.get(t_num, f"Pista {t_num}"),
+                        "artist": track_performers.get(t_num, ""),
+                        "start_lba": start_lba,
+                        "start_sec": float(start_lba / 75.0),
+                        "total_sectors": total_sectors,
+                        "duration": duration,
+                        "formatted_duration": f"{mins:02d}:{secs:02d}"
+                    })
+                with state.lock:
+                    state.toc_offsets = raw_entries
+                    state.toc_leadout = leadout_lba
+        except Exception as e:
+            print(f"Notice: cd-info fallback parse exception: {e}", flush=True)
 
-        # Apply CD-Text metadata to tracks
-        for t in tracks:
-            trk_n = t["track"]
-            if trk_n in track_titles:
-                t["title"] = track_titles[trk_n]
-                if HAS_NATIVE_ENGINE:
-                    try: cdda.cdda_set_track_title(trk_n, track_titles[trk_n].encode("utf-8")[:127])
-                    except Exception: pass
-            if trk_n in track_performers:
-                t["artist"] = track_performers[trk_n]
+    with state.lock:
+        state.album_artist = album_artist
+        state.album_title = album_title
+        state.cover_url = ""
 
-    except Exception as e:
-        print(f"Notice: cd-info CD-Text parse exception: {e}", flush=True)
-
-    state.album_artist = album_artist
-    state.album_title = album_title
-    state.cover_url = ""
+    # 3. If disc has tracks but no CD-TEXT album title, trigger non-blocking MusicBrainz lookup
+    if tracks and not album_title and leadout_lba > 0:
+        threading.Thread(target=auto_enrich_musicbrainz, args=(leadout_lba,), daemon=True).start()
 
     return tracks
 
@@ -702,19 +810,26 @@ def musicbrainz_lookup():
     with state.lock:
         offsets = list(state.toc_offsets)
         leadout = state.toc_leadout
+        actual_durations = {t["track"]: t.get("duration", 0) for t in state.tracks}
+        if not actual_durations and offsets:
+            for i in range(len(offsets)):
+                t_num, start_lba = offsets[i]
+                next_lba = offsets[i + 1][1] if i + 1 < len(offsets) else leadout
+                actual_durations[t_num] = int(max(75, next_lba - start_lba) / 75.0)
 
     if not offsets:
         return {"error": "No hay datos TOC en memoria. Escanea el CD primero.", "releases": []}
 
     first_track = offsets[0][0]
     last_track = offsets[-1][0]
+    expected_track_count = len(offsets)
     # MusicBrainz TOC: first last_track leadout offset1 offset2 ...
-    # All values are in CD frames (sectors at 75 fps). cdparanoia gives us begin_sector directly.
+    # All values are in CD frames (sectors at 75 fps).
     sector_offsets = [o[1] for o in offsets]
 
     # Add 150-frame offset (CD pre-gap standard) to each sector
     mb_offsets = [s + 150 for s in sector_offsets]
-    mb_leadout = leadout + 150 if leadout > 0 else (mb_offsets[-1] + 300)  # rough estimate
+    mb_leadout = leadout + 150 if leadout > 0 else (mb_offsets[-1] + 300)
 
     toc_str = f"{first_track}+{last_track}+{mb_leadout}+" + "+".join(str(o) for o in mb_offsets)
     url = f"https://musicbrainz.org/ws/2/discid/-?toc={urllib.parse.quote(toc_str)}&fmt=json&inc=artist-credits+recordings"
@@ -724,19 +839,29 @@ def musicbrainz_lookup():
         "Accept": "application/json",
     }
 
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {"error": f"Error consultando MusicBrainz: {e}", "releases": []}
+    data = None
+    last_err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(1.2)
+
+    if data is None:
+        return {"error": f"Error consultando MusicBrainz: {last_err}", "releases": []}
 
     releases_raw = data.get("releases", [])
     if not releases_raw:
         return {"error": "No se encontró el disco en MusicBrainz.", "releases": []}
 
     results = []
-    for rel in releases_raw[:10]:  # max 10 results
+    seen_titles = set()
+    for rel in releases_raw:
         rel_id = rel.get("id", "")
         title = rel.get("title", "Desconocido")
         date = rel.get("date", "")[:4]  # year only
@@ -747,22 +872,32 @@ def musicbrainz_lookup():
         if ac:
             artist = ac[0].get("name", "") or ac[0].get("artist", {}).get("name", "")
 
-        # Find the medium that matched the TOC query (it's the one that has a 'tracks' list).
-        # Other media in the release are present in the response but without track data.
         all_media = rel.get("media", [])
         disc_total = len(all_media)
 
+        # Prefer the medium whose track count matches our CD's track count
         matched_medium = None
         disc_number = 1
         for medium in all_media:
-            if medium.get("tracks"):  # only the matching medium has tracks
+            m_tracks = medium.get("tracks", [])
+            if m_tracks and len(m_tracks) == expected_track_count:
                 matched_medium = medium
                 disc_number = medium.get("position", 1)
                 break
+        if not matched_medium:
+            for medium in all_media:
+                if medium.get("tracks"):
+                    matched_medium = medium
+                    disc_number = medium.get("position", 1)
+                    break
 
         track_list = []
+        duration_diff = 0
         if matched_medium:
-            for tr in matched_medium.get("tracks", []):
+            m_tracks = matched_medium.get("tracks", [])
+            if len(m_tracks) != expected_track_count:
+                duration_diff += 5000 * abs(len(m_tracks) - expected_track_count)
+            for tr in m_tracks:
                 tn = tr.get("number", "")
                 try:
                     tn_int = int(tn)
@@ -774,8 +909,12 @@ def musicbrainz_lookup():
                 tr_ac = recording.get("artist-credit", [])
                 if tr_ac:
                     tr_artist = tr_ac[0].get("name", "") or tr_ac[0].get("artist", {}).get("name", "")
-                tr_len_ms = recording.get("length", 0) or 0
-                tr_dur = tr_len_ms // 1000
+                tr_len_ms = recording.get("length") or tr.get("length") or 0
+                tr_dur = int(tr_len_ms) // 1000
+                if tn_int in actual_durations and tr_dur > 0:
+                    duration_diff += abs(actual_durations[tn_int] - tr_dur)
+                else:
+                    duration_diff += 30
                 track_list.append({
                     "track": tn_int,
                     "title": tr_title,
@@ -783,6 +922,8 @@ def musicbrainz_lookup():
                     "duration": tr_dur,
                     "formatted_duration": f"{tr_dur//60:02d}:{tr_dur%60:02d}"
                 })
+        else:
+            duration_diff = 99999
 
         # Cover art from Cover Art Archive
         cover_url = f"https://coverartarchive.org/release/{rel_id}/front-250" if rel_id else ""
@@ -795,10 +936,36 @@ def musicbrainz_lookup():
             "cover_url": cover_url,
             "disc_number": disc_number,
             "disc_total": disc_total,
+            "duration_diff": duration_diff,
             "tracks": track_list,
         })
 
-    return {"releases": results}
+    # Sort releases by closest track-duration match to the physical CD TOC
+    results.sort(key=lambda r: r.get("duration_diff", 99999))
+    return {"releases": results[:10]}
+
+
+def stop_study_streams():
+    """Stops any active Study Mode background audio processes (white noise / lofi) holding ALSA."""
+    procs = []
+    with state.lock:
+        if getattr(state, "study_audio_proc", None):
+            procs.append(state.study_audio_proc)
+            state.study_audio_proc = None
+        if getattr(state, "study_lofi_proc", None):
+            procs.append(state.study_lofi_proc)
+            state.study_lofi_proc = None
+        state.study_lofi_active = False
+        state.study_whitenoise_active = False
+    for p in procs:
+        try:
+            p.terminate()
+            p.wait(timeout=0.3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
 
 
 def stop_playback_unsafe():
@@ -869,6 +1036,21 @@ def monitor_playback_native(track, session_id):
             print("Fin del disco alcanzado. Volviendo a modo espera (idle)...", flush=True)
             break
 
+        # If disc was physically ejected via drive button during playback/pause
+        if engine_state == -2:
+            stop_playback_unsafe()
+            with state.lock:
+                state.tracks = []
+                state.album_title = ""
+                state.album_artist = ""
+                state.cover_url = ""
+                state.current_track = 1
+                state.state = "no_disc"
+                state.error_message = ""
+                state.last_eject_time = time.time()
+            print("Disco expulsado físicamente del lector. Pasando a estado 'no_disc'.", flush=True)
+            break
+
         # If DAC was disconnected or switched to console
         if engine_state == -3:
             stop_playback_unsafe()
@@ -898,6 +1080,8 @@ def monitor_playback(p_read, p_play, track, session_id):
 
     while True:
         time.sleep(0.3)
+        action = None
+        action_arg = None
         with state.lock:
             if state.session_id != session_id or state.state not in ("playing", "starting", "paused"):
                 break
@@ -940,14 +1124,8 @@ def monitor_playback(p_read, p_play, track, session_id):
                         break
 
                     stop_playback_unsafe()
-                    time.sleep(0.6)
-                    dev = get_cd_device()
-                    if os.path.exists(dev):
-                        print(f"Reanudando Pista {track} desde segundo {played_secs:.1f}...", flush=True)
-                        start_playback_unsafe(track, seek_time=played_secs)
-                    else:
-                        state.state = "error"
-                        state.error_message = "Lector de CD desconectado."
+                    action = "retry"
+                    action_arg = played_secs
                     break
 
             if time_exceeded or (read_done and cur_dur > 0 and played_secs >= cur_dur - 1.0):
@@ -960,7 +1138,8 @@ def monitor_playback(p_read, p_play, track, session_id):
                 has_next = any(t["track"] == next_track for t in state.tracks)
                 if has_next:
                     print(f"Pista {track} finalizada ({played_secs:.1f}s). Avanzando automáticamente a Pista {next_track}...", flush=True)
-                    start_playback_unsafe(next_track)
+                    action = "next"
+                    action_arg = next_track
                 else:
                     print("Fin del disco alcanzado. Volviendo a modo espera (idle)...", flush=True)
                     state.current_track = 1
@@ -977,9 +1156,33 @@ def monitor_playback(p_read, p_play, track, session_id):
                     state.error_message = f"Fallo de audio DAC (código {ret_play})."
                     break
 
+        if action == "retry":
+            time.sleep(0.6)
+            if not check_cd_inserted(False):
+                with state.lock:
+                    state.tracks = []
+                    state.state = "no_disc"
+                    state.error_message = ""
+                break
+            dev = get_cd_device()
+            if os.path.exists(dev):
+                print(f"Reanudando Pista {track} desde segundo {action_arg:.1f}...", flush=True)
+                start_playback_unsafe(track, seek_time=action_arg)
+            else:
+                with state.lock:
+                    state.state = "error"
+                    state.error_message = "Lector de CD desconectado."
+            break
+        elif action == "next":
+            start_playback_unsafe(action_arg)
+            break
+
 
 def start_playback_unsafe(track=1, seek_time=0.0):
-    """Starts playback of a given track using kernel direct pipe cd-read -> aplay."""
+    """Starts playback of a given track using native C engine or fallback pipe cd-read -> aplay."""
+    # Stop Study Mode streams if active so ALSA DAC is free
+    stop_study_streams()
+
     # If Bluetooth or PC audio sharing is active, disable them first
     if state.bluetooth_active:
         if 'bluetooth_ctl' in globals() and bluetooth_ctl:
@@ -1015,7 +1218,9 @@ def start_playback_unsafe(track=1, seek_time=0.0):
     state.current_track = track
 
     if not state.tracks:
-        state.tracks = get_track_list()
+        tracks = get_track_list()
+        with state.lock:
+            state.tracks = tracks
     
     track_obj = next((t for t in state.tracks if t["track"] == track), None)
     if track_obj:
@@ -1045,6 +1250,16 @@ def start_playback_unsafe(track=1, seek_time=0.0):
                     state.current_track = track
                     state.error_message = ""
                 threading.Thread(target=monitor_playback_native, args=(track, current_session), daemon=True).start()
+                return
+            elif ret == -2:
+                with state.lock:
+                    state.tracks = []
+                    state.album_title = ""
+                    state.album_artist = ""
+                    state.cover_url = ""
+                    state.state = "no_disc"
+                    state.error_message = ""
+                print("No hay disco insertado en el lector (cdda_play=-2).", flush=True)
                 return
             elif ret == -3:
                 with state.lock:
@@ -1103,6 +1318,7 @@ def start_playback_unsafe(track=1, seek_time=0.0):
 
 def pc_audio_receiver_loop(mode="low"):
     """GStreamer RTP Receiver for PC & Mobile audio sharing with clock synchronization and zero pops."""
+    stop_study_streams()
     if state.bluetooth_active:
         if 'bluetooth_ctl' in globals() and bluetooth_ctl:
             bluetooth_ctl.disable()
@@ -1111,7 +1327,9 @@ def pc_audio_receiver_loop(mode="low"):
     with state.lock:
         dac_id = state.dac_name
 
-    alsa_dev = f"plughw:{dac_id}" if dac_id != "default" else "default"
+    if dac_id == "disconnected":
+        dac_id = detect_usb_dac()
+    alsa_dev = f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default"
     print(f"Audio Receiver (GStreamer RTP) [Modo: {mode}]: Port 3000, DAC: {alsa_dev}")
 
     if mode == "ultra_low":
@@ -1232,6 +1450,7 @@ class BluetoothController:
                 except Exception: pass
 
         if mode in ("music", "both"):
+            stop_study_streams()
             try:
                 stop_playback_unsafe()
             except Exception:
@@ -1323,7 +1542,9 @@ class BluetoothController:
         self._stop_aplay()
         with self.state.lock:
             dac_id = self.state.dac_name
-        alsa_dev = f"plughw:{dac_id}" if dac_id != "default" else "default"
+        if dac_id == "disconnected":
+            dac_id = detect_usb_dac()
+        alsa_dev = f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default"
         # Bit-perfect playback with no volume modification, direct to DAC
         cmd = ["bluealsa-aplay", "-D", alsa_dev, "--volume=none", "--profile-a2dp"]
         try:
@@ -1376,39 +1597,46 @@ class BluetoothController:
             self.state.cover_url = ""
 
     def _trigger_auto_play(self):
-        def _worker():
-            print("[Bluetooth] Connection detected! Starting auto-play loop...", flush=True)
-            for attempt in range(20):
-                time.sleep(0.5)
-                if not self.state.bluetooth_active:
-                    break
-                with self.state.lock:
-                    if not self.state.bt_connected:
-                        break
-                    if self.state.bt_status == "playing":
-                        print(f"[Bluetooth] Auto-play active (status is playing on attempt {attempt+1})", flush=True)
-                        break
+        if getattr(self, "_autoplay_running", False):
+            return
+        self._autoplay_running = True
 
-                try:
-                    player, control = self._get_player_and_control()
-                    import dbus
-                    sent = False
-                    if player:
-                        try:
-                            dbus.Interface(player, "org.bluez.MediaPlayer1").Play()
-                            sent = True
-                        except Exception:
-                            pass
-                    if control and not sent:
-                        try:
-                            dbus.Interface(control, "org.bluez.MediaControl1").Play()
-                            sent = True
-                        except Exception:
-                            pass
-                    if sent:
-                        print(f"[Bluetooth] Auto-play command sent (attempt {attempt+1})", flush=True)
-                except Exception as e:
-                    print(f"[Bluetooth] Auto-play attempt error: {e}", flush=True)
+        def _worker():
+            try:
+                print("[Bluetooth] Connection detected! Starting auto-play loop...", flush=True)
+                for attempt in range(20):
+                    time.sleep(0.5)
+                    if not self.state.bluetooth_active:
+                        break
+                    with self.state.lock:
+                        if not self.state.bt_connected:
+                            break
+                        if self.state.bt_status == "playing":
+                            print(f"[Bluetooth] Auto-play active (status is playing on attempt {attempt+1})", flush=True)
+                            break
+
+                    try:
+                        player, control = self._get_player_and_control()
+                        import dbus
+                        sent = False
+                        if player:
+                            try:
+                                dbus.Interface(player, "org.bluez.MediaPlayer1").Play()
+                                sent = True
+                            except Exception:
+                                pass
+                        if control and not sent:
+                            try:
+                                dbus.Interface(control, "org.bluez.MediaControl1").Play()
+                                sent = True
+                            except Exception:
+                                pass
+                        if sent:
+                            print(f"[Bluetooth] Auto-play command sent (attempt {attempt+1})", flush=True)
+                    except Exception as e:
+                        print(f"[Bluetooth] Auto-play attempt error: {e}", flush=True)
+            finally:
+                self._autoplay_running = False
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1421,8 +1649,8 @@ class BluetoothController:
             import dbus
             adapter = self.bus.get_object("org.bluez", "/org/bluez/hci0")
             props = dbus.Interface(adapter, "org.freedesktop.DBus.Properties")
-            props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(discoverable))
-            props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(pairable))
+            props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(bool(discoverable), variant_level=1))
+            props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(bool(pairable), variant_level=1))
         except Exception as e:
             print(f"[Bluetooth] Could not set adapter properties: {e}", flush=True)
 
@@ -1449,7 +1677,7 @@ class BluetoothController:
                     if d.get("Paired") and (d.get("Icon") == "phone" or d.get("Address") == "24:95:2F:5C:4E:D3"):
                         candidates.append((path, d.get("Address"), str(d.get("Alias") or d.get("Name") or "")))
 
-            if not candidates:
+            if not candidates and "/org/bluez/hci0/dev_24_95_2F_5C_4E_D3" in objects:
                 candidates.append(("/org/bluez/hci0/dev_24_95_2F_5C_4E_D3", "24:95:2F:5C:4E:D3", "Pixel 7"))
 
             for path, addr, name in candidates:
@@ -1766,7 +1994,7 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
 
         elif parsed_path == "/api/modules":
             self.send_json({
-                "modules": module_manager.list_modules(),
+                "modules": module_manager.list_modules(refresh=True),
                 "capabilities": module_manager.get_active_capabilities(),
                 "voip_enabled": module_manager.has_capability("telephony"),
                 "study_enabled": module_manager.has_capability("study")
@@ -1833,6 +2061,9 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
             return
 
         elif parsed_path == "/api/resume":
+            should_start = False
+            track_to_play = 1
+            seek_pos = 0.0
             with state.lock:
                 if state.state == "paused":
                     if HAS_NATIVE_ENGINE:
@@ -1845,7 +2076,11 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                                 state.p_read.wait(timeout=0.3)
                             except Exception: pass
                             state.p_read = None
-                        start_playback_unsafe(state.current_track, seek_time=state.pause_position)
+                        should_start = True
+                        track_to_play = state.current_track
+                        seek_pos = state.pause_position
+            if should_start:
+                start_playback_unsafe(track_to_play, seek_time=seek_pos)
             self.send_json(state.to_dict())
             return
 
@@ -2164,13 +2399,27 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
             if is_bt:
                 bluetooth_ctl.prev()
             else:
-                prev_track = None
+                target_track = None
                 with state.lock:
-                    pt = state.current_track - 1
-                    if any(t["track"] == pt for t in state.tracks):
-                        prev_track = pt
-                if prev_track is not None:
-                    start_playback_unsafe(prev_track)
+                    cur_t = state.current_track
+                    if HAS_NATIVE_ENGINE:
+                        elapsed = state.bytes_played / 176400.0
+                    elif state.state == "playing" and state.play_start_time > 0:
+                        elapsed = max(0.0, (time.time() - state.play_start_time) + state.seek_offset_time)
+                    else:
+                        elapsed = state.bytes_played / 176400.0
+
+                    # Si ya han pasado más de 3 segundos o estamos en la pista 1, reiniciar pista actual
+                    if elapsed > 3.0 or cur_t <= 1:
+                        target_track = cur_t
+                    else:
+                        pt = cur_t - 1
+                        if any(t["track"] == pt for t in state.tracks):
+                            target_track = pt
+                        else:
+                            target_track = cur_t
+                if target_track is not None:
+                    start_playback_unsafe(target_track)
             self.send_json(state.to_dict())
 
         elif self.path == "/api/next" or parsed_path == "/api/next":
@@ -2193,6 +2442,10 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                 stop_playback_unsafe()
                 state.state = "no_disc"
                 state.tracks = []
+                state.album_title = ""
+                state.album_artist = ""
+                state.cover_url = ""
+                state.last_eject_time = time.time()
             
             def do_eject():
                 subprocess.run(["umount", get_cd_device()], stderr=subprocess.DEVNULL)
@@ -2215,8 +2468,9 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
             
         elif self.path == "/api/refresh" or parsed_path == "/api/refresh":
             def do_refresh():
+                t = get_track_list()
                 with state.lock:
-                    state.tracks = get_track_list()
+                    state.tracks = t
                     if state.tracks:
                         if state.state == "no_disc":
                             state.state = "idle"
@@ -2229,11 +2483,17 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/set_buffer" or parsed_path == "/api/set_buffer":
             ms = int(post_data.get("buffer_ms", 2500))
             ms = max(50, min(10000, ms))
+            should_restart = False
+            cur_track = 1
+            curr_pos = 0.0
             with state.lock:
                 state.buffer_ms = ms
                 if state.state == "playing":
+                    should_restart = True
+                    cur_track = state.current_track
                     curr_pos = state.bytes_played / 176400.0
-                    start_playback_unsafe(state.current_track, seek_time=curr_pos)
+            if should_restart:
+                start_playback_unsafe(cur_track, seek_time=curr_pos)
             self.send_json(state.to_dict())
 
         elif parsed_path == "/api/set_release":
@@ -2258,6 +2518,11 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                         if tnum in existing:
                             existing[tnum]["title"] = nt.get("title", existing[tnum]["title"])
                             existing[tnum]["artist"] = nt.get("artist", existing[tnum]["artist"])
+                            if HAS_NATIVE_ENGINE:
+                                try:
+                                    cdda.cdda_set_track_title(tnum, existing[tnum]["title"].encode("utf-8")[:127])
+                                except Exception:
+                                    pass
                     state.tracks = list(existing.values())
             self.send_json(state.to_dict())
 
@@ -2279,8 +2544,15 @@ def monitor_cd_insertion():
         new_last = last_disc_present  # default: keep previous value on exception
         try:
             with state.lock:
+                # Cooldown tras comando eject para no re-detectar el disco mientras la bandeja sale
+                if (time.time() - getattr(state, "last_eject_time", 0.0)) < 6.0:
+                    new_last = False
+                    toc_failed_since = None
+                    continue
+
                 # If already playing, starting or paused a CD, do not query the drive over SCSI/USB
                 if state.state in ("playing", "starting", "paused"):
+                    new_last = True
                     last_disc_present = True
                     toc_failed_since = None
                     continue
@@ -2301,7 +2573,7 @@ def monitor_cd_insertion():
                 elif disc_present and not last_disc_present:
                     # Fresh insertion: clamp speed immediately and stop any active mode
                     set_drive_speed(2)
-                    print("Disco detectado en el lector. Interrumpiendo otros modos y cargando CD...")
+                    print("Disco detectado en el lector. Interrumpiendo otros modos y cargando CD...", flush=True)
                     if state.pc_audio_active:
                         state.pc_audio_active = False
                         if state.pc_audio_socket:
@@ -2333,15 +2605,15 @@ def monitor_cd_insertion():
                     elapsed = time.time() - (toc_failed_since or time.time())
                     if elapsed > 30:
                         # Give up after 30s of retries
-                        print("No se pudo leer la tabla de contenidos tras 30s. Disco incompatible o sin datos.")
+                        print("No se pudo leer la tabla de contenidos tras 30s. Disco incompatible o sin datos.", flush=True)
                         with state.lock:
                             state.state = "no_disc"
                         toc_failed_since = None
                     else:
-                        print(f"TOC no leído aún, reintentando en 3s (t+{elapsed:.0f}s)...")
+                        print(f"TOC no leído aún, reintentando en 3s (t+{elapsed:.0f}s)...", flush=True)
 
         except Exception as e:
-            print(f"Error en monitor CD: {e}")
+            print(f"Error en monitor CD: {e}", flush=True)
         finally:
             last_disc_present = new_last
 
