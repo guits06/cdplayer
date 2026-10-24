@@ -33,6 +33,7 @@ class StudyModeBackend:
         with self.state.lock:
             proc = self.study_audio_proc
             self.study_audio_proc = None
+            self.state.study_audio_proc = None
             self.state.study_lofi_active = False
             self.state.study_whitenoise_active = False
         if proc:
@@ -50,16 +51,19 @@ class StudyModeBackend:
 
     def start_stream(self, audio_type="lofi"):
         self.stop_stream()
-        with self.state.lock:
-            cd_was_playing = self.state.state in ("playing", "paused")
-        if cd_was_playing:
+        if hasattr(self.state, "stop_cd_playback"):
+            self.state.stop_cd_playback()
+        else:
             try:
-                import main
-                main.stop_playback_unsafe()
+                import sys
+                main_mod = sys.modules.get("main") or sys.modules.get("__main__")
+                if main_mod and hasattr(main_mod, "stop_playback_unsafe"):
+                    main_mod.stop_playback_unsafe()
             except Exception:
                 pass
-            with self.state.lock:
-                self.state.state = "idle"
+
+        with self.state.lock:
+            self.state.state = "idle"
 
         yt_url = WHITENOISE_YOUTUBE_URL if audio_type == "whitenoise" else LOFI_YOUTUBE_URL
         tag = "[RUIDO-BLANCO]" if audio_type == "whitenoise" else "[LOFI]"
@@ -99,6 +103,7 @@ class StudyModeBackend:
             proc = subprocess.Popen(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.study_audio_proc = proc
             with self.state.lock:
+                self.state.study_audio_proc = proc
                 if audio_type == "whitenoise":
                     self.state.study_whitenoise_active = True
                     self.state.study_lofi_active = False
