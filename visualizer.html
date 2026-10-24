@@ -364,6 +364,9 @@
         </footer>
     </div>
 
+    <!-- Fullscreen Button -->
+    <button id="fs-btn" class="fs-btn" title="Pantalla Completa">⛶ Pantalla Completa</button>
+
     <script>
         // Visualizer Client Script - Supports both relative /api/status (reverse proxy/domain) & port 8000 fallback
         const ambientBg = document.getElementById("ambient-bg");
@@ -448,7 +451,26 @@
             }
 
             // Mode / Status
-            if (data.pc_audio_active) {
+            if (data.bluetooth_active) {
+                if (statusText) statusText.textContent = "BLUETOOTH AUDIO";
+                if (statusDot) statusDot.style.backgroundColor = "#89b4fa";
+                const isPlaying = (data.bt_status === "playing");
+                if (isPlaying) {
+                    vinylDisc.classList.add("spinning");
+                    equalizer.classList.add("active");
+                } else {
+                    vinylDisc.classList.remove("spinning");
+                    equalizer.classList.remove("active");
+                }
+                trackTitle.textContent = data.bt_title || (data.bt_connected ? "Audio Bluetooth" : "Esperando conexión...");
+                const btArt = data.bt_artist || "Dispositivo móvil";
+                const btAlb = data.bt_album || "Bluetooth Audio";
+                artistAlbum.textContent = `${btArt} — ${btAlb}`;
+                timeCur.textContent = formatTime(data.bt_elapsed || 0);
+                timeTotal.textContent = formatTime(data.bt_duration || 0);
+                const pct = (data.bt_duration > 0) ? Math.min(100, ((data.bt_elapsed || 0) / data.bt_duration) * 100) : 0;
+                progressFill.style.width = `${pct}%`;
+            } else if (data.pc_audio_active) {
                 if (statusText) statusText.textContent = "COMPARTIENDO PC AUDIO";
                 if (statusDot) statusDot.style.backgroundColor = "#10b981";
                 vinylDisc.classList.remove("spinning");
@@ -468,7 +490,7 @@
                 const activeTrack = (data.tracks || []).find(t => t.track === data.current_track);
                 if (activeTrack) {
                     trackTitle.textContent = activeTrack.title || `Pista ${activeTrack.track}`;
-                    const art = data.artist_name || "Artista Desconocido";
+                    const art = activeTrack.artist || data.album_artist || "Artista Desconocido";
                     const alb = data.album_title || "Álbum Desconocido";
                     artistAlbum.textContent = `${art} — ${alb}`;
 
@@ -500,7 +522,7 @@
                 vinylDisc.classList.remove("spinning");
                 equalizer.classList.remove("active");
                 trackTitle.textContent = data.album_title || "CD de Música";
-                artistAlbum.textContent = data.artist_name || "Listo para reproducir";
+                artistAlbum.textContent = data.album_artist || "Listo para reproducir";
                 timeCur.textContent = "00:00";
                 timeTotal.textContent = "00:00";
                 progressFill.style.width = "0%";
@@ -520,7 +542,9 @@
             }
         }
 
-        fsBtn.addEventListener("click", toggleFS);
+        if (fsBtn) {
+            fsBtn.addEventListener("click", toggleFS);
+        }
         window.addEventListener("keydown", (e) => {
             if (e.key === "f" || e.key === "F") toggleFS();
         });
