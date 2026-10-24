@@ -13,6 +13,7 @@
 #include <linux/cdrom.h>
 #include <alsa/asoundlib.h>
 #include <glob.h>
+#include <limits.h>
 
 #include "cdda_engine.h"
 
@@ -59,9 +60,11 @@ typedef struct {
     pthread_t reader_thread;
     pthread_t player_thread;
     bool threads_running;
-    bool stop_requested;
-    bool pause_requested;
+    volatile bool stop_requested;
+    volatile bool pause_requested;
     pthread_mutex_t state_mutex;
+    pthread_mutex_t lifecycle_mutex;
+    pthread_mutex_t io_mutex;
 
     RingBuffer ring;
 } EngineState;
@@ -97,7 +100,7 @@ static void ring_set_eof(RingBuffer* rb) {
     pthread_mutex_unlock(&rb->mutex);
 }
 
-static size_t ring_write(RingBuffer* rb, const uint8_t* src, size_t bytes, bool* stop_flag) {
+static size_t ring_write(RingBuffer* rb, const uint8_t* src, size_t bytes, volatile bool* stop_flag) {
     size_t written = 0;
     while (written < bytes) {
         pthread_mutex_lock(&rb->mutex);
@@ -132,7 +135,7 @@ static size_t ring_write(RingBuffer* rb, const uint8_t* src, size_t bytes, bool*
     return written;
 }
 
-static size_t ring_read(RingBuffer* rb, uint8_t* dst, size_t bytes, bool* stop_flag) {
+static size_t ring_read(RingBuffer* rb, uint8_t* dst, size_t bytes, volatile bool* stop_flag) {
     size_t bytes_read = 0;
     while (bytes_read < bytes) {
         pthread_mutex_lock(&rb->mutex);
@@ -178,12 +181,36 @@ static int ring_fill_percentage(RingBuffer* rb) {
 
 static int set_hardware_speed(int fd, int speed) {
     if (fd < 0) return -1;
+    // Always keep manual tray door unlocked so hardware eject button works
+    ioctl(fd, CDROM_LOCKDOOR, 0);
     // Standard Linux CD-ROM ioctl (speed in units of 150 KB/s: 2 = 300 KB/s / ~450 RPM)
     return ioctl(fd, CDROM_SELECT_SPEED, speed);
 }
 
+static bool is_disc_removed_fd(int fd) {
+    if (fd < 0) return true;
+    // Require 3 consecutive confirmations 50ms apart to eliminate transient USB-SATA bridge glitches
+    for (int retry = 0; retry < 3; retry++) {
+        pthread_mutex_lock(&g_engine.io_mutex);
+        int st = ioctl(fd, CDROM_DRIVE_STATUS, 0);
+        int err = errno;
+        pthread_mutex_unlock(&g_engine.io_mutex);
+
+        bool removed = (st == CDS_NO_DISC || st == CDS_TRAY_OPEN ||
+                        (st < 0 && (err == ENODEV || err == ENOMEDIUM || err == EBADF)));
+        if (!removed) {
+            return false; // Disc is present or drive is busy/ready
+        }
+        if (retry < 2) {
+            usleep(50000); // 50ms debounce delay
+        }
+    }
+    return true; // Confirmed removed 3 consecutive times across 100ms
+}
+
 // Read raw CDDA sectors via Linux ioctl CDROMREADAUDIO or SCSI MMC-3 fallback
 static int read_cdda_sectors(int fd, int start_lba, int nframes, uint8_t* out_buffer) {
+    pthread_mutex_lock(&g_engine.io_mutex);
     struct cdrom_read_audio ra;
     ra.addr.lba = start_lba;
     ra.addr_format = CDROM_LBA;
@@ -191,7 +218,10 @@ static int read_cdda_sectors(int fd, int start_lba, int nframes, uint8_t* out_bu
     ra.buf = out_buffer;
     
     int ret = ioctl(fd, CDROMREADAUDIO, &ra);
-    if (ret == 0) return nframes;
+    if (ret == 0) {
+        pthread_mutex_unlock(&g_engine.io_mutex);
+        return nframes;
+    }
 
     // Fallback: SCSI MMC-3 READ CD (0xBE) command via CDROM_SEND_PACKET
     struct cdrom_generic_command cgc;
@@ -213,7 +243,97 @@ static int read_cdda_sectors(int fd, int start_lba, int nframes, uint8_t* out_bu
     cgc.timeout = 3000;
 
     ret = ioctl(fd, CDROM_SEND_PACKET, &cgc);
+    pthread_mutex_unlock(&g_engine.io_mutex);
     return (ret == 0) ? nframes : -1;
+}
+
+// Read CD-TEXT directly from Lead-In via SCSI MMC READ TOC/PMA/ATIP (Format 0x05)
+static void read_cdtext_fd(int fd, CDDiscInfo* out_info) {
+    if (fd < 0 || !out_info) return;
+    uint8_t buf[4096];
+    memset(buf, 0, sizeof(buf));
+
+    struct cdrom_generic_command cgc;
+    memset(&cgc, 0, sizeof(cgc));
+    cgc.cmd[0] = 0x43; // GPCMD_READ_TOC_PMA_ATIP
+    cgc.cmd[2] = 0x05; // Format 5: CD-TEXT
+    cgc.cmd[7] = (sizeof(buf) >> 8) & 0xFF;
+    cgc.cmd[8] = sizeof(buf) & 0xFF;
+    cgc.buffer = buf;
+    cgc.buflen = sizeof(buf);
+    cgc.data_direction = CGC_DATA_READ;
+    cgc.quiet = 1;
+    cgc.timeout = 1500;
+
+    if (ioctl(fd, CDROM_SEND_PACKET, &cgc) != 0) {
+        return;
+    }
+
+    int data_len = ((int)buf[0] << 8) | (int)buf[1];
+    if (data_len < 20) return;
+
+    size_t total_bytes = (size_t)data_len + 2;
+    if (total_bytes > sizeof(buf)) total_bytes = sizeof(buf);
+
+    char accum_title[256] = {0};
+    size_t accum_title_len = 0;
+    int cur_title_trk = -1;
+
+    char accum_artist[256] = {0};
+    size_t accum_artist_len = 0;
+    int cur_artist_trk = -1;
+
+    for (size_t offset = 4; offset + 18 <= total_bytes; offset += 18) {
+        const uint8_t* pack = buf + offset;
+        uint8_t pack_type = pack[0];
+        if (pack_type != 0x80 && pack_type != 0x81) continue;
+        if (pack[1] & 0x80) continue; // Skip extension packs
+        if (pack[3] & 0x80) continue; // Skip DBCS 16-bit packs
+
+        int pack_trk = pack[1] & 0x7F;
+        char* accum = (pack_type == 0x80) ? accum_title : accum_artist;
+        size_t* accum_len = (pack_type == 0x80) ? &accum_title_len : &accum_artist_len;
+        int* cur_trk = (pack_type == 0x80) ? &cur_title_trk : &cur_artist_trk;
+
+        if (*cur_trk < 0 || (*accum_len == 0 && (pack[3] & 0x0F) == 0)) {
+            *cur_trk = pack_trk;
+        }
+
+        for (int j = 4; j < 16; j++) {
+            char c = (char)pack[j];
+            if (c != '\0') {
+                if (*accum_len + 1 < 255) {
+                    accum[(*accum_len)++] = c;
+                    accum[*accum_len] = '\0';
+                }
+            } else {
+                if (*accum_len > 0 && accum[0] != '\t') {
+                    int t = *cur_trk;
+                    if (t == 0) {
+                        if (pack_type == 0x80) {
+                            snprintf(out_info->album_title, sizeof(out_info->album_title), "%.127s", accum);
+                        } else {
+                            snprintf(out_info->album_artist, sizeof(out_info->album_artist), "%.127s", accum);
+                        }
+                    } else if (t >= out_info->first_track && t <= out_info->last_track) {
+                        int idx = t - out_info->first_track;
+                        if (idx >= 0 && idx < out_info->track_count) {
+                            if (pack_type == 0x80) {
+                                snprintf(out_info->tracks[idx].title, sizeof(out_info->tracks[idx].title), "%.127s", accum);
+                            } else {
+                                snprintf(out_info->tracks[idx].artist, sizeof(out_info->tracks[idx].artist), "%.127s", accum);
+                            }
+                        }
+                    }
+                }
+                *accum_len = 0;
+                accum[0] = '\0';
+                if (*cur_trk >= 0) {
+                    (*cur_trk)++;
+                }
+            }
+        }
+    }
 }
 
 // Read CD Table of Contents (TOC) directly from open file descriptor
@@ -265,6 +385,9 @@ static int read_disc_info_fd(int fd, CDDiscInfo* out_info) {
         out_info->tracks[i].duration_sec = sectors / CD_FRAMES_PER_SEC;
     }
 
+    // Read native CD-TEXT from Lead-In if present (< 10ms)
+    read_cdtext_fd(fd, out_info);
+
     return count;
 }
 
@@ -276,12 +399,14 @@ static int open_cd_device_with_fallback(const char* preferred_path) {
     #define ADD_CANDIDATE(p) do { \
         const char* _p = (p); \
         if (_p && _p[0] && access(_p, F_OK) == 0) { \
+            char resolved[PATH_MAX]; \
+            const char* actual = realpath(_p, resolved) ? resolved : _p; \
             bool dup = false; \
             for (int k = 0; k < n_candidates; k++) { \
-                if (strcmp(candidates[k], _p) == 0) { dup = true; break; } \
+                if (strcmp(candidates[k], actual) == 0) { dup = true; break; } \
             } \
             if (!dup && n_candidates < 16) { \
-                snprintf(candidates[n_candidates++], sizeof(candidates[0]), "%s", _p); \
+                snprintf(candidates[n_candidates++], sizeof(candidates[0]), "%.255s", actual); \
             } \
         } \
     } while(0)
@@ -306,16 +431,28 @@ static int open_cd_device_with_fallback(const char* preferred_path) {
     ADD_CANDIDATE("/dev/cdrom");
 
     for (int retry = 0; retry < 15; retry++) {
+        bool any_spinning_up = false;
         for (int i = 0; i < n_candidates; i++) {
             int fd = open(candidates[i], O_RDONLY | O_NONBLOCK);
             if (fd >= 0) {
+                ioctl(fd, CDROM_LOCKDOOR, 0);
+                int drv_status = ioctl(fd, CDROM_DRIVE_STATUS, 0);
+                if (drv_status == CDS_NO_DISC || drv_status == CDS_TRAY_OPEN) {
+                    close(fd);
+                    continue;
+                }
                 struct cdrom_tochdr th;
                 if (ioctl(fd, CDROMREADTOCHDR, &th) == 0) {
                     snprintf(g_engine.device_path, sizeof(g_engine.device_path), "%.255s", candidates[i]);
                     return fd;
                 }
+                any_spinning_up = true;
                 close(fd);
             }
+        }
+        if (!any_spinning_up) {
+            errno = ENOMEDIUM;
+            break;
         }
         usleep(100000); // 100ms
     }
@@ -341,6 +478,7 @@ static void* reader_thread_func(void* arg) {
     (void)arg;
     uint8_t batch_buf[READ_BATCH_BYTES];
     int fd = g_engine.cd_fd;
+    int consecutive_sector_failures = 0;
 
     while (!g_engine.stop_requested) {
         // Gapless track boundary check
@@ -373,9 +511,47 @@ static void* reader_thread_func(void* arg) {
 
         int sectors_read = read_cdda_sectors(fd, g_engine.current_read_lba, to_read, batch_buf);
         if (sectors_read <= 0) {
-            // Read error or retry
-            usleep(30000);
-            continue;
+            // Fallback to single-sector retry for scratched/damaged sectors
+            bool recovered = false;
+            for (int r = 0; r < 3 && !g_engine.stop_requested; r++) {
+                usleep(15000);
+                sectors_read = read_cdda_sectors(fd, g_engine.current_read_lba, 1, batch_buf);
+                if (sectors_read > 0) {
+                    recovered = true;
+                    break;
+                }
+            }
+
+            if (!recovered) {
+                if (is_disc_removed_fd(fd)) {
+                    pthread_mutex_lock(&g_engine.state_mutex);
+                    snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "Disco expulsado");
+                    g_engine.state = -2;
+                    pthread_mutex_unlock(&g_engine.state_mutex);
+                    pthread_mutex_lock(&g_engine.ring.mutex);
+                    g_engine.stop_requested = true;
+                    g_engine.ring.eof = true;
+                    pthread_cond_broadcast(&g_engine.ring.not_empty);
+                    pthread_mutex_unlock(&g_engine.ring.mutex);
+                    break;
+                }
+                consecutive_sector_failures++;
+                if (consecutive_sector_failures > 75) { // > 1 second of completely unreadable disc
+                    pthread_mutex_lock(&g_engine.state_mutex);
+                    snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "Error de lectura óptica en sector %d", g_engine.current_read_lba);
+                    g_engine.state = -1;
+                    pthread_mutex_unlock(&g_engine.state_mutex);
+                    ring_set_eof(&g_engine.ring);
+                    break;
+                }
+                // Conceal single damaged sector (13.3ms) with silence so playback never hangs
+                memset(batch_buf, 0, CD_FRAME_SIZE);
+                sectors_read = 1;
+            } else {
+                consecutive_sector_failures = 0;
+            }
+        } else {
+            consecutive_sector_failures = 0;
         }
 
         size_t bytes = (size_t)sectors_read * CD_FRAME_SIZE;
@@ -405,6 +581,10 @@ static void* player_thread_func(void* arg) {
             g_engine.state = -1;
         }
         pthread_mutex_unlock(&g_engine.state_mutex);
+        pthread_mutex_lock(&g_engine.ring.mutex);
+        g_engine.stop_requested = true;
+        pthread_cond_broadcast(&g_engine.ring.not_full);
+        pthread_mutex_unlock(&g_engine.ring.mutex);
         return NULL;
     }
 
@@ -457,15 +637,48 @@ static void* player_thread_func(void* arg) {
     #define CHUNK_FRAMES 1024
     uint8_t read_buf[CHUNK_FRAMES * 4];
     int32_t s32_buf[CHUNK_FRAMES * 2];
+    int eof_check_counter = 0;
 
     while (!g_engine.stop_requested) {
         if (g_engine.pause_requested) {
-            snd_pcm_pause(pcm, 1);
+            bool hw_paused = (snd_pcm_pause(pcm, 1) == 0);
+            if (!hw_paused) {
+                snd_pcm_drop(pcm);
+            }
+            int pause_ticks = 0;
             while (g_engine.pause_requested && !g_engine.stop_requested) {
+                if (++pause_ticks >= 10) { // Check physical eject every ~500ms while paused
+                    pause_ticks = 0;
+                    if (is_disc_removed_fd(g_engine.cd_fd)) {
+                        pthread_mutex_lock(&g_engine.state_mutex);
+                        snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "Disco expulsado");
+                        g_engine.state = -2;
+                        pthread_mutex_unlock(&g_engine.state_mutex);
+                        g_engine.stop_requested = true;
+                        break;
+                    }
+                }
                 usleep(50000);
             }
-            snd_pcm_pause(pcm, 0);
             if (g_engine.stop_requested) break;
+            if (hw_paused) {
+                if (snd_pcm_pause(pcm, 0) < 0) snd_pcm_prepare(pcm);
+            } else {
+                snd_pcm_prepare(pcm);
+            }
+        }
+
+        // If reader finished (ring.eof) and we are draining the last ~46s of RAM buffer, check physical eject
+        if (g_engine.ring.eof && ++eof_check_counter >= 20) {
+            eof_check_counter = 0;
+            if (is_disc_removed_fd(g_engine.cd_fd)) {
+                pthread_mutex_lock(&g_engine.state_mutex);
+                snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "Disco expulsado");
+                g_engine.state = -2;
+                pthread_mutex_unlock(&g_engine.state_mutex);
+                g_engine.stop_requested = true;
+                break;
+            }
         }
 
         size_t n = ring_read(&g_engine.ring, read_buf, sizeof(read_buf), &g_engine.stop_requested);
@@ -481,37 +694,52 @@ static void* player_thread_func(void* arg) {
         }
 
         snd_pcm_uframes_t frames = n / 4;
-        snd_pcm_sframes_t written = 0;
-
         if (need_s32) {
             // Bit-perfect shift to 32-bit container (MSB aligned: original 16 bits untouched)
             const int16_t* src16 = (const int16_t*)read_buf;
             for (size_t i = 0; i < frames * 2; i++) {
                 s32_buf[i] = ((int32_t)src16[i]) << 16;
             }
-            written = snd_pcm_writei(pcm, s32_buf, frames);
-        } else {
-            written = snd_pcm_writei(pcm, read_buf, frames);
         }
 
-        if (written < 0) {
-            if (written == -EPIPE) {
-                snd_pcm_prepare(pcm);
-            } else if (written == -ESTRPIPE) {
-                while ((err = snd_pcm_resume(pcm)) == -EAGAIN) sleep(1);
-                if (err < 0) snd_pcm_prepare(pcm);
-            } else if (written == -ENODEV || written == -EIO || written == -EBADFD) {
-                pthread_mutex_lock(&g_engine.state_mutex);
-                snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "DAC desconectado o entrada cambiada a consola");
-                g_engine.state = -3;
-                pthread_mutex_unlock(&g_engine.state_mutex);
-                break;
+        snd_pcm_uframes_t offset_frames = 0;
+        bool dac_err = false;
+        while (offset_frames < frames && !g_engine.stop_requested) {
+            snd_pcm_sframes_t written = 0;
+            if (need_s32) {
+                written = snd_pcm_writei(pcm, s32_buf + (offset_frames * 2), frames - offset_frames);
+            } else {
+                written = snd_pcm_writei(pcm, read_buf + (offset_frames * 4), frames - offset_frames);
             }
-        } else {
-            pthread_mutex_lock(&g_engine.state_mutex);
-            g_engine.frames_played += written;
-            pthread_mutex_unlock(&g_engine.state_mutex);
+
+            if (written < 0) {
+                if (written == -EPIPE) {
+                    snd_pcm_prepare(pcm);
+                } else if (written == -ESTRPIPE) {
+                    while ((err = snd_pcm_resume(pcm)) == -EAGAIN && !g_engine.stop_requested) usleep(100000);
+                    if (err < 0) snd_pcm_prepare(pcm);
+                } else if (written == -EAGAIN || written == -EINTR) {
+                    continue;
+                } else {
+                    pthread_mutex_lock(&g_engine.state_mutex);
+                    snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "DAC desconectado o entrada cambiada a consola");
+                    g_engine.state = -3;
+                    pthread_mutex_unlock(&g_engine.state_mutex);
+                    dac_err = true;
+                    break;
+                }
+            } else {
+                offset_frames += (snd_pcm_uframes_t)written;
+                pthread_mutex_lock(&g_engine.state_mutex);
+                g_engine.frames_played += (uint64_t)written;
+                pthread_mutex_unlock(&g_engine.state_mutex);
+            }
         }
+        if (dac_err) break;
+    }
+
+    if (g_engine.stop_requested) {
+        snd_pcm_drop(pcm);
     }
 
     pthread_mutex_lock(&g_engine.state_mutex);
@@ -521,7 +749,7 @@ static void* player_thread_func(void* arg) {
     snd_pcm_close(pcm);
 
     pthread_mutex_lock(&g_engine.state_mutex);
-    if (!g_engine.stop_requested && g_engine.state != -3) {
+    if (!g_engine.stop_requested && g_engine.state == 1) {
         g_engine.state = 0; // idle (disc completed)
     }
     pthread_mutex_unlock(&g_engine.state_mutex);
@@ -533,23 +761,25 @@ static void* player_thread_func(void* arg) {
 
 static void stop_worker_threads_locked(void) {
     if (!g_engine.threads_running) return;
+    g_engine.threads_running = false;
 
+    pthread_mutex_lock(&g_engine.ring.mutex);
     g_engine.stop_requested = true;
     g_engine.pause_requested = false;
-    if (g_engine.active_pcm) {
-        snd_pcm_drop(g_engine.active_pcm);
-    }
     pthread_cond_broadcast(&g_engine.ring.not_empty);
     pthread_cond_broadcast(&g_engine.ring.not_full);
+    pthread_mutex_unlock(&g_engine.ring.mutex);
+
+    pthread_t rt = g_engine.reader_thread;
+    pthread_t pt = g_engine.player_thread;
 
     // Release state_mutex while joining to prevent deadlock
     pthread_mutex_unlock(&g_engine.state_mutex);
 
-    pthread_join(g_engine.reader_thread, NULL);
-    pthread_join(g_engine.player_thread, NULL);
+    pthread_join(rt, NULL);
+    pthread_join(pt, NULL);
 
     pthread_mutex_lock(&g_engine.state_mutex);
-    g_engine.threads_running = false;
 }
 
 // --- PUBLIC API IMPLEMENTATION ---
@@ -566,6 +796,8 @@ int cdda_init(const char* device_path, int speed_x) {
     if (g_engine.initialized) {
         cdda_stop();
         pthread_mutex_destroy(&g_engine.state_mutex);
+        pthread_mutex_destroy(&g_engine.lifecycle_mutex);
+        pthread_mutex_destroy(&g_engine.io_mutex);
         pthread_mutex_destroy(&g_engine.ring.mutex);
         pthread_cond_destroy(&g_engine.ring.not_empty);
         pthread_cond_destroy(&g_engine.ring.not_full);
@@ -578,7 +810,9 @@ int cdda_init(const char* device_path, int speed_x) {
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&g_engine.state_mutex, &attr);
+    pthread_mutex_init(&g_engine.lifecycle_mutex, &attr);
     pthread_mutexattr_destroy(&attr);
+    pthread_mutex_init(&g_engine.io_mutex, NULL);
 
     ring_init(&g_engine.ring);
 
@@ -597,8 +831,8 @@ int cdda_init(const char* device_path, int speed_x) {
         strncpy(g_engine.device_path, "/dev/sr0", sizeof(g_engine.device_path) - 1);
     }
 
-    // Test device open & set hardware speed limit (whisper-quiet 2x, ~400 RPM)
-    int fd = open_cd_device_with_fallback(g_engine.device_path);
+    // Unlock door & set hardware speed limit (whisper-quiet 2x, ~400 RPM) without blocking if no disc
+    int fd = open(g_engine.device_path, O_RDONLY | O_NONBLOCK);
     if (fd >= 0) {
         set_hardware_speed(fd, g_engine.speed_x);
         close(fd);
@@ -608,6 +842,7 @@ int cdda_init(const char* device_path, int speed_x) {
 
 int cdda_read_disc_info(CDDiscInfo* out_info) {
     if (!out_info) return -1;
+    pthread_mutex_lock(&g_engine.lifecycle_mutex);
     pthread_mutex_lock(&g_engine.state_mutex);
 
     int fd = g_engine.cd_fd;
@@ -616,14 +851,17 @@ int cdda_read_disc_info(CDDiscInfo* out_info) {
         fd = open_cd_device_with_fallback(g_engine.device_path);
         if (fd < 0) {
             pthread_mutex_unlock(&g_engine.state_mutex);
+            pthread_mutex_unlock(&g_engine.lifecycle_mutex);
             return -1;
         }
         need_close = true;
     }
 
+    pthread_mutex_lock(&g_engine.io_mutex);
     set_hardware_speed(fd, g_engine.speed_x);
-
     int ret = read_disc_info_fd(fd, out_info);
+    pthread_mutex_unlock(&g_engine.io_mutex);
+
     if (ret >= 0) {
         g_engine.disc_info = *out_info;
     }
@@ -633,10 +871,12 @@ int cdda_read_disc_info(CDDiscInfo* out_info) {
     }
 
     pthread_mutex_unlock(&g_engine.state_mutex);
+    pthread_mutex_unlock(&g_engine.lifecycle_mutex);
     return ret;
 }
 
 int cdda_play(int track, double seek_sec, const char* alsa_device) {
+    pthread_mutex_lock(&g_engine.lifecycle_mutex);
     pthread_mutex_lock(&g_engine.state_mutex);
 
     // Stop active playback threads WITHOUT closing cd_fd
@@ -651,6 +891,13 @@ int cdda_play(int track, double seek_sec, const char* alsa_device) {
         strncpy(g_engine.alsa_device, alsa_device, sizeof(g_engine.alsa_device) - 1);
     }
 
+    // Validate existing cd_fd still has a disc
+    if (g_engine.cd_fd >= 0 && is_disc_removed_fd(g_engine.cd_fd)) {
+        close(g_engine.cd_fd);
+        g_engine.cd_fd = -1;
+        memset(&g_engine.disc_info, 0, sizeof(g_engine.disc_info));
+    }
+
     // Keep spindle motor spinning: reuse open cd_fd if already valid
     if (g_engine.cd_fd < 0) {
         int fd = open_cd_device_with_fallback(g_engine.device_path);
@@ -658,17 +905,20 @@ int cdda_play(int track, double seek_sec, const char* alsa_device) {
             snprintf(g_engine.error_msg, sizeof(g_engine.error_msg), "Cannot open CD drive: %s", strerror(errno));
             g_engine.state = -1;
             pthread_mutex_unlock(&g_engine.state_mutex);
+            pthread_mutex_unlock(&g_engine.lifecycle_mutex);
             return -2;
         }
         g_engine.cd_fd = fd;
     }
 
+    pthread_mutex_lock(&g_engine.io_mutex);
     set_hardware_speed(g_engine.cd_fd, g_engine.speed_x);
 
     // If TOC is not yet loaded, read it
     if (g_engine.disc_info.track_count <= 0) {
         read_disc_info_fd(g_engine.cd_fd, &g_engine.disc_info);
     }
+    pthread_mutex_unlock(&g_engine.io_mutex);
 
     CDDiscInfo* info = &g_engine.disc_info;
     if (info->track_count <= 0 || track < info->first_track || track > info->last_track) {
@@ -677,11 +927,14 @@ int cdda_play(int track, double seek_sec, const char* alsa_device) {
                  track, info->track_count, info->first_track, info->last_track);
         g_engine.state = -1;
         pthread_mutex_unlock(&g_engine.state_mutex);
+        pthread_mutex_unlock(&g_engine.lifecycle_mutex);
         return -1;
     }
 
     CDTrack* trk = &info->tracks[track - info->first_track];
     int seek_sectors = (int)(seek_sec * CD_FRAMES_PER_SEC);
+    if (seek_sectors < 0) seek_sectors = 0;
+    if (seek_sectors >= trk->total_sectors) seek_sectors = trk->total_sectors - 1;
     int start_lba = trk->start_lba + seek_sectors;
 
     g_engine.current_track = track;
@@ -701,6 +954,7 @@ int cdda_play(int track, double seek_sec, const char* alsa_device) {
     pthread_create(&g_engine.player_thread, NULL, player_thread_func, NULL);
 
     pthread_mutex_unlock(&g_engine.state_mutex);
+    pthread_mutex_unlock(&g_engine.lifecycle_mutex);
     return 0;
 }
 
@@ -725,16 +979,19 @@ int cdda_resume(void) {
 }
 
 int cdda_stop(void) {
+    pthread_mutex_lock(&g_engine.lifecycle_mutex);
     pthread_mutex_lock(&g_engine.state_mutex);
     stop_worker_threads_locked();
 
     // Close drive descriptor on explicit stop or eject
     if (g_engine.cd_fd >= 0) {
+        ioctl(g_engine.cd_fd, CDROM_LOCKDOOR, 0);
         close(g_engine.cd_fd);
         g_engine.cd_fd = -1;
     }
     g_engine.state = 0; // Idle
     pthread_mutex_unlock(&g_engine.state_mutex);
+    pthread_mutex_unlock(&g_engine.lifecycle_mutex);
     return 0;
 }
 
@@ -749,7 +1006,8 @@ int cdda_get_status(CDStatus* out_status) {
     if (g_engine.disc_info.track_count > 0 && g_engine.state != 0) {
         // 1 sector = 588 frames (75 sectors/sec * 588 frames = 44100 frames/sec)
         // Accurately map DAC played frames to current playing sector & track
-        int current_playing_lba = g_engine.playback_initial_lba + (int)(g_engine.frames_played / 588);
+        double current_playing_lba_exact = (double)g_engine.playback_initial_lba + ((double)g_engine.frames_played / 588.0);
+        int current_playing_lba = (int)current_playing_lba_exact;
 
         int cur_trk = g_engine.current_track;
         double elapsed = 0.0;
@@ -763,7 +1021,7 @@ int cdda_get_status(CDStatus* out_status) {
 
             if (current_playing_lba >= t->start_lba && current_playing_lba < next_start) {
                 cur_trk = t->track_num;
-                elapsed = (double)(current_playing_lba - t->start_lba) / 75.0;
+                elapsed = (current_playing_lba_exact - (double)t->start_lba) / 75.0;
                 duration = t->duration_sec;
                 break;
             }
@@ -793,6 +1051,8 @@ int cdda_get_status(CDStatus* out_status) {
 void cdda_close(void) {
     cdda_stop();
     pthread_mutex_destroy(&g_engine.state_mutex);
+    pthread_mutex_destroy(&g_engine.lifecycle_mutex);
+    pthread_mutex_destroy(&g_engine.io_mutex);
     pthread_mutex_destroy(&g_engine.ring.mutex);
     pthread_cond_destroy(&g_engine.ring.not_empty);
     pthread_cond_destroy(&g_engine.ring.not_full);
