@@ -231,6 +231,8 @@ static void plugin_on_activate(PanelContext* ctx) {
 
 static void plugin_on_deactivate(PanelContext* ctx) {
     ctx->is_active = false;
+    g_lofi_active = false;
+    g_whitenoise_active = false;
     ctx->queue_action("/api/study/disable", "");
 }
 
