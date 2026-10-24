@@ -175,8 +175,12 @@ static std::string json_extract_string(const std::string& json, const std::strin
     size_t start = json.find('"', pos);
     if (start == std::string::npos) return "";
     start++;
-    size_t end = json.find('"', start);
-    if (end == std::string::npos) return "";
+    size_t end = start;
+    while (end < json.size()) {
+        if (json[end] == '"' && (end == start || json[end - 1] != '\\')) break;
+        end++;
+    }
+    if (end >= json.size()) return "";
     std::string raw = json.substr(start, end - start);
 
     std::string out;
@@ -268,15 +272,47 @@ static std::vector<TrackInfo> json_extract_tracks(const std::string& json) {
     if (pos == std::string::npos) return list;
     size_t array_start = json.find('[', pos);
     if (array_start == std::string::npos) return list;
-    size_t array_end = json.find(']', array_start);
+
+    int bracket_depth = 0;
+    size_t array_end = std::string::npos;
+    bool in_str = false;
+    for (size_t k = array_start; k < json.size(); k++) {
+        if (json[k] == '"' && (k == 0 || json[k - 1] != '\\')) in_str = !in_str;
+        if (!in_str) {
+            if (json[k] == '[') bracket_depth++;
+            else if (json[k] == ']') {
+                bracket_depth--;
+                if (bracket_depth == 0) {
+                    array_end = k;
+                    break;
+                }
+            }
+        }
+    }
     if (array_end == std::string::npos) return list;
 
     size_t cur = array_start;
     while (cur < array_end) {
         size_t obj_start = json.find('{', cur);
         if (obj_start == std::string::npos || obj_start >= array_end) break;
-        size_t obj_end = json.find('}', obj_start);
-        if (obj_end == std::string::npos || obj_end > array_end) break;
+
+        int brace_depth = 0;
+        size_t obj_end = std::string::npos;
+        bool in_obj_str = false;
+        for (size_t k = obj_start; k <= array_end; k++) {
+            if (json[k] == '"' && (k == 0 || json[k - 1] != '\\')) in_obj_str = !in_obj_str;
+            if (!in_obj_str) {
+                if (json[k] == '{') brace_depth++;
+                else if (json[k] == '}') {
+                    brace_depth--;
+                    if (brace_depth == 0) {
+                        obj_end = k;
+                        break;
+                    }
+                }
+            }
+        }
+        if (obj_end == std::string::npos) break;
 
         std::string obj_str = json.substr(obj_start, obj_end - obj_start + 1);
         TrackInfo ti;
@@ -346,6 +382,7 @@ static void network_worker_func() {
                 const auto& trk = data.tracks[data.current_track - 1];
                 data.track_duration = trk.duration;
                 data.track_title = trk.title.empty() ? ("Pista " + std::to_string(data.current_track)) : trk.title;
+                if (!trk.artist.empty() && data.album_artist.empty()) data.album_artist = trk.artist;
             } else {
                 data.track_duration = 0.0;
                 data.track_title = "Pista " + std::to_string(data.current_track);
@@ -1211,7 +1248,7 @@ int main(int argc, char* argv[]) {
                         // Progress bar seek
                         if (touch_x >= prog_x && touch_x <= (prog_x + prog_w) &&
                             touch_y >= (prog_y - 14) && touch_y <= (prog_y + prog_h + 14)) {
-                            if (cur.track_duration > 0 && cur.state == "playing") {
+                            if (cur.track_duration > 0 && (cur.state == "playing" || cur.state == "paused")) {
                                 double frac = (double)(touch_x - prog_x) / (double)prog_w;
                                 if (frac < 0.0) frac = 0.0;
                                 if (frac > 1.0) frac = 1.0;
@@ -1514,13 +1551,17 @@ int main(int argc, char* argv[]) {
         render_text(renderer, font_title, title_str, CTP_TEXT, center_x, meta_y + 22, true, &tc_title);
 
         std::string artist_str = state_snap.album_artist;
-        if (artist_str.empty()) {
+        SDL_Color artist_col = CTP_SUBTEXT0;
+        if (!state_snap.error_message.empty() && (state_snap.state == "error" || state_snap.state == "idle")) {
+            artist_str = "⚠ " + state_snap.error_message;
+            artist_col = CTP_RED;
+        } else if (artist_str.empty()) {
             if (no_disc) artist_str = "Inserta un disco CD-Audio";
             else if (state_snap.pc_audio_active) artist_str = "Receptor de audio 24-bit/48kHz";
             else if (state_snap.bluetooth_active) artist_str = state_snap.bt_connected ? "Conectado por Bluetooth" : "Bluetooth desconectado";
             else artist_str = "Artista desconocido";
         }
-        render_text(renderer, font_sub, artist_str, CTP_SUBTEXT0, center_x, meta_y + 54, true, &tc_artist);
+        render_text(renderer, font_sub, artist_str, artist_col, center_x, meta_y + 54, true, &tc_artist);
 
         // 3. PROGRESS BAR & TIMERS (TIMERS POSITIONED 22PX ABOVE BAR - ZERO OVERLAP)
         double elapsed = state_snap.elapsed_time;
