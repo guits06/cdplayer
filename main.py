@@ -341,6 +341,11 @@ class PlayerState:
         self.study_lofi_proc = None
         self.aux_volume = 80
         self.last_eject_time = 0.0
+        # Channel volumes (0-100) and mute flags
+        self.vol_l = 100
+        self.vol_r = 100
+        self.mute_l = False
+        self.mute_r = False
 
     def stop_cd_playback(self):
         with self.lock:
@@ -398,6 +403,11 @@ class PlayerState:
                 "study_lofi_active": getattr(self, "study_lofi_active", False),
                 "study_whitenoise_active": getattr(self, "study_whitenoise_active", False),
                 "aux_volume": getattr(self, "aux_volume", 80),
+                "vol_l": getattr(self, "vol_l", 100),
+                "vol_r": getattr(self, "vol_r", 100),
+                "mute_l": getattr(self, "mute_l", False),
+                "mute_r": getattr(self, "mute_r", False),
+                "bit_perfect": (getattr(self, "vol_l", 100) >= 100 and getattr(self, "vol_r", 100) >= 100 and not getattr(self, "mute_l", False) and not getattr(self, "mute_r", False)),
                 "voip_module_enabled": self.voip_module_enabled,
                 "study_module_enabled": self.study_module_enabled,
                 "capabilities": module_manager.get_active_capabilities(),
@@ -468,6 +478,15 @@ try:
         cdda.cdda_set_track_title.restype = ctypes.c_int
         cdda.cdda_set_device.argtypes = [ctypes.c_char_p]
         cdda.cdda_set_device.restype = ctypes.c_int
+        cdda.cdda_set_channel_volume.argtypes = [ctypes.c_int, ctypes.c_int]
+        cdda.cdda_set_channel_volume.restype = ctypes.c_int
+        cdda.cdda_set_channel_mute.argtypes = [ctypes.c_int, ctypes.c_int]
+        cdda.cdda_set_channel_mute.restype = ctypes.c_int
+        cdda.cdda_get_channel_volume.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+        ]
+        cdda.cdda_get_channel_volume.restype = ctypes.c_int
         cdda.cdda_close.restype = None
 
         dev_bytes = get_cd_device().encode("utf-8")
@@ -1493,7 +1512,8 @@ class BluetoothController:
             self.monitor_thread.start()
 
     def enable(self):
-        self.set_mode("both")
+        mode = "both" if module_manager.has_capability("telephony") else "music"
+        self.set_mode(mode)
 
     def disable(self):
         self._stop_aplay()
@@ -1536,7 +1556,39 @@ class BluetoothController:
         if cur_mode != "off" or is_active:
             self.disable()
         else:
-            self.set_mode("both")
+            mode = "both" if module_manager.has_capability("telephony") else "music"
+            self.set_mode(mode)
+
+    def _get_active_pcm_path(self):
+        try:
+            res = subprocess.run(["bluealsa-cli", "list-pcms"], capture_output=True, text=True, timeout=1.0)
+            for line in res.stdout.strip().splitlines():
+                if "a2dpsnk/source" in line:
+                    return line.strip()
+        except Exception:
+            pass
+        return None
+
+    def set_volume(self, vol_l, vol_r):
+        """Sets BlueALSA soft-volume for active PCM."""
+        try:
+            pcm = self._get_active_pcm_path()
+            if pcm:
+                avg = max(0, min(100, (vol_l + vol_r) / 2.0))
+                v = int(round(avg * 1.27))
+                subprocess.run(["bluealsa-cli", "volume", pcm, str(v)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0)
+        except Exception:
+            pass
+
+    def set_mute(self, mute_l, mute_r):
+        """Sets BlueALSA mute switch for active PCM."""
+        try:
+            pcm = self._get_active_pcm_path()
+            if pcm:
+                state_str = "true" if (mute_l or mute_r) else "false"
+                subprocess.run(["bluealsa-cli", "mute", pcm, state_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0)
+        except Exception:
+            pass
 
     def _start_aplay(self):
         self._stop_aplay()
@@ -1545,8 +1597,8 @@ class BluetoothController:
         if dac_id == "disconnected":
             dac_id = detect_usb_dac()
         alsa_dev = f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default"
-        # Bit-perfect playback with no volume modification, direct to DAC
-        cmd = ["bluealsa-aplay", "-D", alsa_dev, "--volume=none", "--profile-a2dp"]
+        # Software volume allows phone AVRCP and internal soft-volume without hardware mixer
+        cmd = ["bluealsa-aplay", "-D", alsa_dev, "--volume=software", "--profile-a2dp"]
         try:
             self.aplay_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[Bluetooth] bluealsa-aplay started on {alsa_dev} (PID: {self.aplay_proc.pid})", flush=True)
@@ -1992,6 +2044,16 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": "No UI available for module"}, 404)
                     return
 
+        elif parsed_path == "/api/volume":
+            with state.lock:
+                vl = getattr(state, "vol_l", 100)
+                vr = getattr(state, "vol_r", 100)
+                ml = getattr(state, "mute_l", False)
+                mr = getattr(state, "mute_r", False)
+                bp = (vl >= 100 and vr >= 100 and not ml and not mr)
+            self.send_json({"vol_l": vl, "vol_r": vr, "mute_l": ml, "mute_r": mr, "bit_perfect": bp})
+            return
+
         elif parsed_path == "/api/modules":
             self.send_json({
                 "modules": module_manager.list_modules(refresh=True),
@@ -2146,6 +2208,79 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                 post_data = json.loads(self.rfile.read(content_length).decode('utf-8'))
             except Exception:
                 pass
+
+        if parsed_path == "/api/volume/reset":
+            with state.lock:
+                state.vol_l = 100
+                state.vol_r = 100
+                state.mute_l = False
+                state.mute_r = False
+                if HAS_NATIVE_ENGINE:
+                    try:
+                        cdda.cdda_set_channel_volume(100, 100)
+                        cdda.cdda_set_channel_mute(0, 0)
+                    except Exception as e:
+                        print(f"Error resetting volume: {e}", flush=True)
+                if state.bluetooth_active:
+                    bluetooth_ctl.set_volume(100, 100)
+                    bluetooth_ctl.set_mute(False, False)
+            self.send_json(state.to_dict())
+            return
+
+        elif parsed_path == "/api/volume/mute":
+            channel = str(post_data.get("channel", "")).upper()
+            with state.lock:
+                if channel == "L":
+                    state.mute_l = not state.mute_l
+                elif channel == "R":
+                    state.mute_r = not state.mute_r
+                elif channel in ("BOTH", "ALL"):
+                    new_m = not (state.mute_l and state.mute_r)
+                    state.mute_l = new_m
+                    state.mute_r = new_m
+                if "mute_l" in post_data:
+                    state.mute_l = bool(post_data["mute_l"])
+                if "mute_r" in post_data:
+                    state.mute_r = bool(post_data["mute_r"])
+                if HAS_NATIVE_ENGINE:
+                    try:
+                        cdda.cdda_set_channel_mute(1 if state.mute_l else 0, 1 if state.mute_r else 0)
+                    except Exception as e:
+                        print(f"Error setting mute: {e}", flush=True)
+                if state.bluetooth_active:
+                    bluetooth_ctl.set_mute(state.mute_l, state.mute_r)
+            self.send_json(state.to_dict())
+            return
+
+        elif parsed_path == "/api/volume":
+            with state.lock:
+                if post_data.get("reset"):
+                    state.vol_l = 100
+                    state.vol_r = 100
+                    state.mute_l = False
+                    state.mute_r = False
+                else:
+                    if "vol_l" in post_data:
+                        try: state.vol_l = max(0, min(100, int(post_data["vol_l"])))
+                        except Exception: pass
+                    if "vol_r" in post_data:
+                        try: state.vol_r = max(0, min(100, int(post_data["vol_r"])))
+                        except Exception: pass
+                    if "mute_l" in post_data:
+                        state.mute_l = bool(post_data["mute_l"])
+                    if "mute_r" in post_data:
+                        state.mute_r = bool(post_data["mute_r"])
+                if HAS_NATIVE_ENGINE:
+                    try:
+                        cdda.cdda_set_channel_volume(state.vol_l, state.vol_r)
+                        cdda.cdda_set_channel_mute(1 if state.mute_l else 0, 1 if state.mute_r else 0)
+                    except Exception as e:
+                        print(f"Error setting volume: {e}", flush=True)
+                if state.bluetooth_active:
+                    bluetooth_ctl.set_volume(state.vol_l, state.vol_r)
+                    bluetooth_ctl.set_mute(state.mute_l, state.mute_r)
+            self.send_json(state.to_dict())
+            return
 
         if self.path.startswith("/api/play") or parsed_path == "/api/play":
             target_track = post_data.get("track")

@@ -90,6 +90,11 @@ struct PlayerData {
     double bt_duration = 0.0;
     double bt_elapsed = 0.0;
     int buffer_fill_pct = 0;
+    int vol_l = 100;
+    int vol_r = 100;
+    bool mute_l = false;
+    bool mute_r = false;
+    bool bit_perfect = true;
     std::vector<std::string> capabilities;
     std::vector<TrackInfo> tracks;
 
@@ -101,6 +106,9 @@ struct PlayerData {
 static std::mutex g_state_mutex;
 static PlayerData g_player;
 static std::atomic<bool> g_running(true);
+static bool g_dragging_vol_l = false;
+static bool g_dragging_vol_r = false;
+static Uint32 g_last_vol_send_time = 0;
 
 // Action Queue for non-blocking HTTP requests
 struct ActionCmd {
@@ -370,6 +378,11 @@ static void network_worker_func() {
             data.bt_duration = json_extract_number(json, "bt_duration", 0.0);
             data.bt_elapsed = json_extract_number(json, "bt_elapsed", 0.0);
             data.buffer_fill_pct = (int)json_extract_number(json, "buffer_fill_pct", 0);
+            data.vol_l = (int)json_extract_number(json, "vol_l", 100);
+            data.vol_r = (int)json_extract_number(json, "vol_r", 100);
+            data.mute_l = json_extract_bool(json, "mute_l", false);
+            data.mute_r = json_extract_bool(json, "mute_r", false);
+            data.bit_perfect = json_extract_bool(json, "bit_perfect", (data.vol_l >= 100 && data.vol_r >= 100 && !data.mute_l && !data.mute_r));
             data.tracks = json_extract_tracks(json);
 
             if (data.bluetooth_active) {
@@ -390,6 +403,14 @@ static void network_worker_func() {
 
             {
                 std::lock_guard<std::mutex> lock(g_state_mutex);
+                if (g_dragging_vol_l) {
+                    data.vol_l = g_player.vol_l;
+                    data.mute_l = g_player.mute_l;
+                }
+                if (g_dragging_vol_r) {
+                    data.vol_r = g_player.vol_r;
+                    data.mute_r = g_player.mute_r;
+                }
                 g_player = data;
             }
         } else {
@@ -645,6 +666,47 @@ static void draw_icon_dac(SDL_Renderer* ren, int cx, int cy, int size, SDL_Color
     }
 }
 
+static void draw_icon_speaker(SDL_Renderer* ren, int cx, int cy, int size, SDL_Color col) {
+    set_color(ren, col);
+    int s = size / 2;
+    SDL_Rect box = {cx - s, cy - s / 2, s / 2 + 1, s};
+    SDL_RenderFillRect(ren, &box);
+    for (int x = 0; x <= s / 2; x++) {
+        int half_h = (s / 2) + x;
+        SDL_RenderDrawLine(ren, cx - s / 2 + x, cy - half_h, cx - s / 2 + x, cy + half_h);
+    }
+    // Subtle sound wave arcs
+    draw_circle_outline(ren, cx + s / 4, cy, s / 2, col);
+    draw_circle_outline(ren, cx + s / 4, cy, s - 1, col);
+}
+
+static void draw_icon_speaker_mute(SDL_Renderer* ren, int cx, int cy, int size, SDL_Color col) {
+    set_color(ren, col);
+    int s = size / 2;
+    SDL_Rect box = {cx - s, cy - s / 2, s / 2 + 1, s};
+    SDL_RenderFillRect(ren, &box);
+    for (int x = 0; x <= s / 2; x++) {
+        int half_h = (s / 2) + x;
+        SDL_RenderDrawLine(ren, cx - s / 2 + x, cy - half_h, cx - s / 2 + x, cy + half_h);
+    }
+    // Cross 'X'
+    int x1 = cx + 4, y1 = cy - 4;
+    int x2 = cx + 11, y2 = cy + 4;
+    SDL_RenderDrawLine(ren, x1, y1, x2, y2);
+    SDL_RenderDrawLine(ren, x1 + 1, y1, x2 + 1, y2);
+    SDL_RenderDrawLine(ren, x1, y2, x2, y1);
+    SDL_RenderDrawLine(ren, x1 + 1, y2, x2 + 1, y1);
+}
+
+static void draw_icon_reset(SDL_Renderer* ren, int cx, int cy, int size, SDL_Color col) {
+    set_color(ren, col);
+    int r = size / 2 - 2;
+    draw_circle_outline(ren, cx, cy, r, col);
+    draw_circle_outline(ren, cx, cy, r - 1, col);
+    SDL_RenderDrawLine(ren, cx, cy - r - 3, cx + 4, cy - r);
+    SDL_RenderDrawLine(ren, cx, cy - r + 3, cx + 4, cy - r);
+}
+
 // Text rendering helper with texture caching and right alignment support
 struct TextCache {
     std::string text;
@@ -729,7 +791,8 @@ enum ButtonID {
 // --- SCREENS ENUM ---
 enum PanelScreen {
     SCREEN_PLAYER = 0,
-    SCREEN_DAC = 1
+    SCREEN_DAC = 1,
+    SCREEN_VOLUME = 2
 };
 static PanelScreen g_current_screen = SCREEN_PLAYER;
 
@@ -1104,9 +1167,15 @@ int main(int argc, char* argv[]) {
                     else if (cur.state == "paused") queue_action("/api/resume");
                     else queue_action("/api/play");
                 } else if (ev.key.keysym.sym == SDLK_RIGHT || ev.key.keysym.sym == SDLK_d) {
-                    if (!g_active_mod) g_current_screen = SCREEN_DAC;
+                    if (!g_active_mod) {
+                        if (g_current_screen == SCREEN_PLAYER) g_current_screen = SCREEN_DAC;
+                        else if (g_current_screen == SCREEN_DAC) g_current_screen = SCREEN_VOLUME;
+                    }
                 } else if (ev.key.keysym.sym == SDLK_LEFT || ev.key.keysym.sym == SDLK_a) {
-                    if (!g_active_mod) g_current_screen = SCREEN_PLAYER;
+                    if (!g_active_mod) {
+                        if (g_current_screen == SCREEN_VOLUME) g_current_screen = SCREEN_DAC;
+                        else if (g_current_screen == SCREEN_DAC) g_current_screen = SCREEN_PLAYER;
+                    }
                 }
             } else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_FINGERDOWN) {
                 if (now - last_touch_action_time < 90) {
@@ -1141,15 +1210,92 @@ int main(int argc, char* argv[]) {
 
                 // 2. DAC Screen Touch
                 if (g_current_screen == SCREEN_DAC) {
-                    if (touch_x >= 16 && touch_x <= 170 && touch_y >= 10 && touch_y <= 52) {
+                    if (touch_x >= 16 && touch_x <= 170 && touch_y >= 9 && touch_y <= 52) {
                         g_current_screen = SCREEN_PLAYER;
                         last_touch_action_time = now;
-                    } else if (touch_x >= (screen_w - 90) && touch_x <= screen_w && touch_y >= 10 && touch_y <= 52) {
+                    } else if (touch_x >= (screen_w - 180) && touch_x <= screen_w && touch_y >= 9 && touch_y <= 52) {
+                        g_current_screen = SCREEN_VOLUME;
+                        last_touch_action_time = now;
+                    }
+                } else if (g_current_screen == SCREEN_VOLUME) {
+                    // 3. Volume Screen Touch
+                    if (touch_x >= 16 && touch_x <= 170 && touch_y >= 9 && touch_y <= 52) {
+                        g_current_screen = SCREEN_DAC;
+                        last_touch_action_time = now;
+                    } else if (touch_x >= (screen_w - 180) && touch_x <= screen_w && touch_y >= 9 && touch_y <= 52) {
+                        g_current_screen = SCREEN_PLAYER;
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 120 && touch_x <= 270 && touch_y >= 120 && touch_y <= 355) {
+                        // Left Channel Bar Touch
+                        g_dragging_vol_l = true;
+                        double frac = 1.0 - (double)(touch_y - 125) / 220.0;
+                        frac = std::clamp(frac, 0.0, 1.0);
+                        int nv = (int)std::round(frac * 100.0);
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            g_player.vol_l = nv;
+                            g_player.mute_l = false;
+                        }
+                        queue_action("/api/volume", "{\"vol_l\": " + std::to_string(nv) + ", \"mute_l\": false}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 530 && touch_x <= 680 && touch_y >= 120 && touch_y <= 355) {
+                        // Right Channel Bar Touch
+                        g_dragging_vol_r = true;
+                        double frac = 1.0 - (double)(touch_y - 125) / 220.0;
+                        frac = std::clamp(frac, 0.0, 1.0);
+                        int nv = (int)std::round(frac * 100.0);
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            g_player.vol_r = nv;
+                            g_player.mute_r = false;
+                        }
+                        queue_action("/api/volume", "{\"vol_r\": " + std::to_string(nv) + ", \"mute_r\": false}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 120 && touch_x <= 260 && touch_y >= 360 && touch_y <= 425) {
+                        // Mute L
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            g_player.mute_l = !g_player.mute_l;
+                        }
+                        queue_action("/api/volume/mute", "{\"channel\": \"L\"}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 540 && touch_x <= 680 && touch_y >= 360 && touch_y <= 425) {
+                        // Mute R
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            g_player.mute_r = !g_player.mute_r;
+                        }
+                        queue_action("/api/volume/mute", "{\"channel\": \"R\"}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 260 && touch_x <= 540 && touch_y >= 225 && touch_y <= 290) {
+                        // Reestablecer 100% Bit-Perfect
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            g_player.vol_l = 100;
+                            g_player.vol_r = 100;
+                            g_player.mute_l = false;
+                            g_player.mute_r = false;
+                        }
+                        queue_action("/api/volume/reset", "{}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 260 && touch_x <= 540 && touch_y >= 292 && touch_y <= 348) {
+                        // Silenciar / Activar Ambos
+                        bool both_m = false;
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            both_m = !(g_player.mute_l && g_player.mute_r);
+                            g_player.mute_l = both_m;
+                            g_player.mute_r = both_m;
+                        }
+                        queue_action("/api/volume/mute", "{\"channel\": \"both\"}");
+                        last_touch_action_time = now;
+                    } else if (touch_x >= 260 && touch_x <= 540 && touch_y >= 350 && touch_y <= 405) {
+                        // Ir al Reproductor
                         g_current_screen = SCREEN_PLAYER;
                         last_touch_action_time = now;
                     }
                 } else {
-                    // 3. Player Screen Touch
+                    // 4. Player Screen Touch
                     if (touch_y < 44 && touch_x >= (center_x - 120) && touch_x <= (center_x + 120)) {
                         g_current_screen = SCREEN_DAC;
                         last_touch_action_time = now;
@@ -1270,9 +1416,60 @@ int main(int argc, char* argv[]) {
                 }
                 if (g_active_mod && plugin_ctx.is_active && g_active_mod->on_touch_motion) {
                     g_active_mod->on_touch_motion(&plugin_ctx, move_x, move_y);
+                } else if (g_current_screen == SCREEN_VOLUME) {
+                    if (g_dragging_vol_l) {
+                        double frac = 1.0 - (double)(move_y - 125) / 220.0;
+                        frac = std::clamp(frac, 0.0, 1.0);
+                        int nv = (int)std::round(frac * 100.0);
+                        int old_v = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            old_v = g_player.vol_l;
+                            g_player.vol_l = nv;
+                            g_player.mute_l = false;
+                        }
+                        if (nv != old_v && (now - g_last_vol_send_time > 75)) {
+                            g_last_vol_send_time = now;
+                            queue_action("/api/volume", "{\"vol_l\": " + std::to_string(nv) + ", \"mute_l\": false}");
+                        }
+                    } else if (g_dragging_vol_r) {
+                        double frac = 1.0 - (double)(move_y - 125) / 220.0;
+                        frac = std::clamp(frac, 0.0, 1.0);
+                        int nv = (int)std::round(frac * 100.0);
+                        int old_v = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(g_state_mutex);
+                            old_v = g_player.vol_r;
+                            g_player.vol_r = nv;
+                            g_player.mute_r = false;
+                        }
+                        if (nv != old_v && (now - g_last_vol_send_time > 75)) {
+                            g_last_vol_send_time = now;
+                            queue_action("/api/volume", "{\"vol_r\": " + std::to_string(nv) + ", \"mute_r\": false}");
+                        }
+                    }
                 }
             } else if (ev.type == SDL_MOUSEBUTTONUP || ev.type == SDL_FINGERUP) {
                 for (auto& btn : base_buttons) btn.pressed = false;
+
+                if (g_dragging_vol_l) {
+                    g_dragging_vol_l = false;
+                    int vl = 100;
+                    { std::lock_guard<std::mutex> lk(g_state_mutex); vl = g_player.vol_l; }
+                    queue_action("/api/volume", "{\"vol_l\": " + std::to_string(vl) + ", \"mute_l\": false}");
+                    touch_is_down = false;
+                    last_touch_action_time = now;
+                    continue;
+                }
+                if (g_dragging_vol_r) {
+                    g_dragging_vol_r = false;
+                    int vr = 100;
+                    { std::lock_guard<std::mutex> lk(g_state_mutex); vr = g_player.vol_r; }
+                    queue_action("/api/volume", "{\"vol_r\": " + std::to_string(vr) + ", \"mute_r\": false}");
+                    touch_is_down = false;
+                    last_touch_action_time = now;
+                    continue;
+                }
 
                 if (touch_is_down) {
                     touch_is_down = false;
@@ -1297,12 +1494,22 @@ int main(int argc, char* argv[]) {
                     Uint32 duration = now - touch_down_time;
 
                     if (abs_dx > 50 && abs_dx > abs_dy * 1.3 && duration < 700) {
-                        if (g_current_screen == SCREEN_PLAYER) {
-                            g_current_screen = SCREEN_DAC;
-                            last_touch_action_time = now;
-                        } else if (g_current_screen == SCREEN_DAC) {
-                            g_current_screen = SCREEN_PLAYER;
-                            last_touch_action_time = now;
+                        if (dx < 0) { // Deslizar dedo hacia la izquierda (avanzar a pantalla de la derecha)
+                            if (g_current_screen == SCREEN_PLAYER) {
+                                g_current_screen = SCREEN_DAC;
+                                last_touch_action_time = now;
+                            } else if (g_current_screen == SCREEN_DAC) {
+                                g_current_screen = SCREEN_VOLUME;
+                                last_touch_action_time = now;
+                            }
+                        } else if (dx > 0) { // Deslizar dedo hacia la derecha (volver a pantalla de la izquierda)
+                            if (g_current_screen == SCREEN_VOLUME) {
+                                g_current_screen = SCREEN_DAC;
+                                last_touch_action_time = now;
+                            } else if (g_current_screen == SCREEN_DAC) {
+                                g_current_screen = SCREEN_PLAYER;
+                                last_touch_action_time = now;
+                            }
                         }
                     }
                 }
@@ -1375,12 +1582,19 @@ int main(int argc, char* argv[]) {
             render_text(renderer, font_badge, "REPRODUCTOR", CTP_LAVENDER, 48, 19, false);
 
             // Centered Title
-            draw_icon_dac(renderer, center_x - 130, 27, 18, CTP_BLUE);
-            render_text(renderer, font_header, "INFORMACIÓN DEL DAC", CTP_TEXT, center_x, 17, true);
+            draw_icon_dac(renderer, center_x - 130, 20, 18, CTP_BLUE);
+            render_text(renderer, font_header, "INFORMACIÓN DEL DAC", CTP_TEXT, center_x, 12, true);
 
-            // Page indicator dots
-            draw_circle_outline(renderer, screen_w - 44, 27, 5, CTP_OVERLAY0);
-            draw_circle_filled(renderer, screen_w - 28, 27, 5, CTP_LAVENDER);
+            // 3 Page indicator dots
+            draw_circle_outline(renderer, center_x - 18, 38, 4, CTP_OVERLAY0);
+            draw_circle_filled(renderer, center_x, 38, 4, CTP_LAVENDER);
+            draw_circle_outline(renderer, center_x + 18, 38, 4, CTP_OVERLAY0);
+
+            // Next button to Volume screen (Top Right)
+            SDL_Rect next_rect = {screen_w - 170, 9, 154, 36};
+            draw_rounded_rect(renderer, next_rect, 8, CTP_SURFACE0, true);
+            render_text(renderer, font_badge, "VOLUMEN L/R", CTP_LAVENDER, screen_w - 156, 19, false);
+            draw_icon_next(renderer, screen_w - 30, 27, 14, CTP_LAVENDER);
 
             // --- Card 1: DISPOSITIVO DETECTADO (Top-Left) ---
             int card1_x = 16;
@@ -1454,21 +1668,248 @@ int main(int argc, char* argv[]) {
             render_text(renderer, font_badge, "USB Asíncrono 125µs / Hardware Clock", CTP_TEXT, card3_x + 200, card3_y + 128, false);
 
             // Footer
-            render_text(renderer, font_badge, "Desliza ← o pulsa 'REPRODUCTOR' para volver", CTP_OVERLAY0, center_x, screen_h - 24, true);
+            render_text(renderer, font_badge, "Desliza ← para VOLUMEN L/R | Desliza → para REPRODUCTOR", CTP_OVERLAY0, center_x, screen_h - 24, true);
 
             SDL_RenderPresent(renderer);
-            SDL_Delay(66);
+            SDL_Delay(33);
             continue;
         }
 
         // =========================================================================
-        // SCREEN 3: MAIN PLAYER SCREEN (SCREEN_PLAYER)
+        // SCREEN 3: CHANNEL VOLUME & BIT-PERFECT BALANCE (SCREEN_VOLUME)
+        // =========================================================================
+        if (g_current_screen == SCREEN_VOLUME) {
+            // --- Top Header Bar ---
+            SDL_Rect vol_top = {0, 0, screen_w, 54};
+            set_color(renderer, CTP_MANTLE);
+            SDL_RenderFillRect(renderer, &vol_top);
+            set_color(renderer, CTP_SURFACE0);
+            SDL_RenderDrawLine(renderer, 0, 54, screen_w, 54);
+
+            // Back button to DAC
+            SDL_Rect back_rect = {16, 9, 148, 36};
+            draw_rounded_rect(renderer, back_rect, 8, CTP_SURFACE0, true);
+            draw_icon_prev(renderer, 30, 27, 14, CTP_LAVENDER);
+            render_text(renderer, font_badge, "INFO DAC", CTP_LAVENDER, 52, 19, false);
+
+            // Centered Title
+            draw_icon_speaker(renderer, center_x - 155, 20, 20, CTP_BLUE);
+            render_text(renderer, font_header, "VOLUMEN DE CANALES (L / R)", CTP_TEXT, center_x, 12, true);
+
+            // 3 Page indicator dots
+            draw_circle_outline(renderer, center_x - 18, 38, 4, CTP_OVERLAY0);
+            draw_circle_outline(renderer, center_x, 38, 4, CTP_OVERLAY0);
+            draw_circle_filled(renderer, center_x + 18, 38, 4, CTP_LAVENDER);
+
+            // Shortcut to Player
+            SDL_Rect play_rect = {screen_w - 170, 9, 154, 36};
+            draw_rounded_rect(renderer, play_rect, 8, CTP_SURFACE0, true);
+            render_text(renderer, font_badge, "REPRODUCTOR", CTP_LAVENDER, screen_w - 156, 19, false);
+            draw_icon_next(renderer, screen_w - 30, 27, 14, CTP_LAVENDER);
+
+            // Snapshot values
+            int vl = state_snap.vol_l;
+            int vr = state_snap.vol_r;
+            bool ml = state_snap.mute_l;
+            bool mr = state_snap.mute_r;
+            bool is_bp = (vl >= 100 && vr >= 100 && !ml && !mr);
+
+            // --- CANAL L (IZQUIERDA) ---
+            int l_bar_x = 155;
+            int bar_y = 125;
+            int bar_w = 90;
+            int bar_h = 220;
+
+            render_text(renderer, font_header, "CANAL L", CTP_BLUE, l_bar_x + bar_w / 2, 68, true);
+            if (ml) {
+                render_text(renderer, font_header, "MUTE", CTP_RED, l_bar_x + bar_w / 2, 94, true);
+            } else if (vl >= 100) {
+                render_text(renderer, font_header, "100%", CTP_GREEN, l_bar_x + bar_w / 2, 94, true);
+            } else {
+                render_text(renderer, font_header, std::to_string(vl) + "%", CTP_TEXT, l_bar_x + bar_w / 2, 94, true);
+            }
+
+            // Left Bar slot
+            SDL_Rect l_bg = {l_bar_x, bar_y, bar_w, bar_h};
+            draw_rounded_rect(renderer, l_bg, 12, CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, l_bg, 12, CTP_SURFACE2, false);
+
+            // Left Fill
+            if (vl > 0 && !ml) {
+                int fill_h = (int)((vl / 100.0) * (bar_h - 8));
+                if (fill_h > bar_h - 8) fill_h = bar_h - 8;
+                SDL_Rect l_fill = {l_bar_x + 4, bar_y + bar_h - 4 - fill_h, bar_w - 8, fill_h};
+                SDL_Color l_col = (vl >= 100) ? CTP_GREEN : CTP_BLUE;
+                draw_rounded_rect(renderer, l_fill, 8, l_col, true);
+            } else if (ml) {
+                set_color(renderer, CTP_RED);
+                SDL_RenderDrawLine(renderer, l_bar_x + 10, bar_y + 10, l_bar_x + bar_w - 10, bar_y + bar_h - 10);
+                SDL_RenderDrawLine(renderer, l_bar_x + 10, bar_y + bar_h - 10, l_bar_x + bar_w - 10, bar_y + 10);
+            }
+
+            // Ticks along the left bar
+            set_color(renderer, CTP_SURFACE2);
+            SDL_RenderDrawLine(renderer, l_bar_x - 12, bar_y + 4, l_bar_x - 4, bar_y + 4);
+            render_text(renderer, font_mono, "0dB", CTP_SUBTEXT0, l_bar_x - 38, bar_y - 2, false);
+            SDL_RenderDrawLine(renderer, l_bar_x - 8, bar_y + bar_h / 2, l_bar_x - 4, bar_y + bar_h / 2);
+            render_text(renderer, font_mono, "-6", CTP_OVERLAY0, l_bar_x - 26, bar_y + bar_h / 2 - 8, false);
+            SDL_RenderDrawLine(renderer, l_bar_x - 12, bar_y + bar_h - 4, l_bar_x - 4, bar_y + bar_h - 4);
+            render_text(renderer, font_mono, "-∞", CTP_SUBTEXT0, l_bar_x - 26, bar_y + bar_h - 12, false);
+
+            // Left Mute Button
+            int mb_w = 120;
+            int mb_h = 44;
+            SDL_Rect l_mute_btn = {l_bar_x - (mb_w - bar_w) / 2, bar_y + bar_h + 18, mb_w, mb_h};
+            draw_rounded_rect(renderer, l_mute_btn, 8, ml ? CTP_RED : CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, l_mute_btn, 8, ml ? CTP_RED : CTP_SURFACE2, false);
+            if (ml) {
+                draw_icon_speaker_mute(renderer, l_mute_btn.x + 24, l_mute_btn.y + 22, 16, CTP_CRUST);
+                render_text(renderer, font_badge, "MUTED L", CTP_CRUST, l_mute_btn.x + 44, l_mute_btn.y + 14, false);
+            } else {
+                draw_icon_speaker(renderer, l_mute_btn.x + 22, l_mute_btn.y + 22, 16, CTP_LAVENDER);
+                render_text(renderer, font_badge, "MUTE L", CTP_TEXT, l_mute_btn.x + 44, l_mute_btn.y + 14, false);
+            }
+
+            // --- CANAL R (DERECHA) ---
+            int r_bar_x = 555;
+            render_text(renderer, font_header, "CANAL R", CTP_BLUE, r_bar_x + bar_w / 2, 68, true);
+            if (mr) {
+                render_text(renderer, font_header, "MUTE", CTP_RED, r_bar_x + bar_w / 2, 94, true);
+            } else if (vr >= 100) {
+                render_text(renderer, font_header, "100%", CTP_GREEN, r_bar_x + bar_w / 2, 94, true);
+            } else {
+                render_text(renderer, font_header, std::to_string(vr) + "%", CTP_TEXT, r_bar_x + bar_w / 2, 94, true);
+            }
+
+            // Right Bar slot
+            SDL_Rect r_bg = {r_bar_x, bar_y, bar_w, bar_h};
+            draw_rounded_rect(renderer, r_bg, 12, CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, r_bg, 12, CTP_SURFACE2, false);
+
+            // Right Fill
+            if (vr > 0 && !mr) {
+                int fill_h = (int)((vr / 100.0) * (bar_h - 8));
+                if (fill_h > bar_h - 8) fill_h = bar_h - 8;
+                SDL_Rect r_fill = {r_bar_x + 4, bar_y + bar_h - 4 - fill_h, bar_w - 8, fill_h};
+                SDL_Color r_col = (vr >= 100) ? CTP_GREEN : CTP_BLUE;
+                draw_rounded_rect(renderer, r_fill, 8, r_col, true);
+            } else if (mr) {
+                set_color(renderer, CTP_RED);
+                SDL_RenderDrawLine(renderer, r_bar_x + 10, bar_y + 10, r_bar_x + bar_w - 10, bar_y + bar_h - 10);
+                SDL_RenderDrawLine(renderer, r_bar_x + 10, bar_y + bar_h - 10, r_bar_x + bar_w - 10, bar_y + 10);
+            }
+
+            // Ticks along the right bar
+            set_color(renderer, CTP_SURFACE2);
+            SDL_RenderDrawLine(renderer, r_bar_x + bar_w + 4, bar_y + 4, r_bar_x + bar_w + 12, bar_y + 4);
+            render_text(renderer, font_mono, "0dB", CTP_SUBTEXT0, r_bar_x + bar_w + 16, bar_y - 2, false);
+            SDL_RenderDrawLine(renderer, r_bar_x + bar_w + 4, bar_y + bar_h / 2, r_bar_x + bar_w + 8, bar_y + bar_h / 2);
+            render_text(renderer, font_mono, "-6", CTP_OVERLAY0, r_bar_x + bar_w + 12, bar_y + bar_h / 2 - 8, false);
+            SDL_RenderDrawLine(renderer, r_bar_x + bar_w + 4, bar_y + bar_h - 4, r_bar_x + bar_w + 12, bar_y + bar_h - 4);
+            render_text(renderer, font_mono, "-∞", CTP_SUBTEXT0, r_bar_x + bar_w + 16, bar_y + bar_h - 12, false);
+
+            // Right Mute Button
+            SDL_Rect r_mute_btn = {r_bar_x - (mb_w - bar_w) / 2, bar_y + bar_h + 18, mb_w, mb_h};
+            draw_rounded_rect(renderer, r_mute_btn, 8, mr ? CTP_RED : CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, r_mute_btn, 8, mr ? CTP_RED : CTP_SURFACE2, false);
+            if (mr) {
+                draw_icon_speaker_mute(renderer, r_mute_btn.x + 24, r_mute_btn.y + 22, 16, CTP_CRUST);
+                render_text(renderer, font_badge, "MUTED R", CTP_CRUST, r_mute_btn.x + 44, r_mute_btn.y + 14, false);
+            } else {
+                draw_icon_speaker(renderer, r_mute_btn.x + 22, r_mute_btn.y + 22, 16, CTP_LAVENDER);
+                render_text(renderer, font_badge, "MUTE R", CTP_TEXT, r_mute_btn.x + 44, r_mute_btn.y + 14, false);
+            }
+
+            // --- COLUMNA CENTRAL (CONTROLES Y STATUS) ---
+            int cc_w = 230;
+            int cc_x = center_x - cc_w / 2;
+
+            // 1. Bit-Perfect Status Card
+            SDL_Rect bp_card = {cc_x, 68, cc_w, 82};
+            draw_rounded_rect(renderer, bp_card, 10, CTP_MANTLE, true);
+            draw_rounded_rect(renderer, bp_card, 10, is_bp ? CTP_GREEN : CTP_SURFACE1, false);
+            if (is_bp) {
+                draw_circle_filled(renderer, cc_x + 24, 88, 6, CTP_GREEN);
+                render_text(renderer, font_album, "ESTADO: BIT-PERFECT", CTP_GREEN, cc_x + 38, 80, false);
+                render_text(renderer, font_badge, "100% Salida directa ALSA", CTP_TEXT, center_x, 106, true);
+                render_text(renderer, font_badge, "Señal exacta sin alteración", CTP_SUBTEXT0, center_x, 126, true);
+            } else {
+                SDL_Color stat_col = (ml || mr) ? CTP_RED : CTP_PEACH;
+                draw_circle_filled(renderer, cc_x + 24, 88, 6, stat_col);
+                render_text(renderer, font_album, (ml || mr) ? "CANAL SILENCIADO" : "ATENUACIÓN ACTIVA", stat_col, cc_x + 38, 80, false);
+                render_text(renderer, font_badge, (ml || mr) ? "Salida modificada (Mute)" : "Atenuación digital en C", CTP_TEXT, center_x, 106, true);
+                render_text(renderer, font_badge, "Pulsa Reestablecer p/ Bit-Perfect", CTP_SUBTEXT0, center_x, 126, true);
+            }
+
+            // 2. Balance Meter Card
+            SDL_Rect bal_card = {cc_x, 158, cc_w, 62};
+            draw_rounded_rect(renderer, bal_card, 10, CTP_MANTLE, true);
+            draw_rounded_rect(renderer, bal_card, 10, CTP_SURFACE0, false);
+            int bal_track_y = 178;
+            set_color(renderer, CTP_SURFACE1);
+            SDL_RenderDrawLine(renderer, center_x - 70, bal_track_y, center_x + 70, bal_track_y);
+            SDL_RenderDrawLine(renderer, center_x - 70, bal_track_y + 1, center_x + 70, bal_track_y + 1);
+            set_color(renderer, CTP_SURFACE2);
+            SDL_RenderDrawLine(renderer, center_x, bal_track_y - 4, center_x, bal_track_y + 4);
+            int diff = vr - vl;
+            if (ml && !mr) diff = 100;
+            else if (mr && !ml) diff = -100;
+            else if (ml && mr) diff = 0;
+            int ball_x = center_x + (int)(diff * 0.65);
+            draw_circle_filled(renderer, ball_x, bal_track_y, 5, is_bp ? CTP_GREEN : CTP_LAVENDER);
+            if (diff == 0) {
+                render_text(renderer, font_badge, "BALANCE: CENTRO (0 dB)", CTP_SUBTEXT0, center_x, 196, true);
+            } else if (diff < 0) {
+                render_text(renderer, font_badge, "BALANCE: IZQUIERDA", CTP_PEACH, center_x, 196, true);
+            } else {
+                render_text(renderer, font_badge, "BALANCE: DERECHA", CTP_PEACH, center_x, 196, true);
+            }
+
+            // 3. Botón Reestablecer 100% (The Restore Button)
+            SDL_Rect rst_btn = {cc_x, 230, cc_w, 56};
+            draw_rounded_rect(renderer, rst_btn, 10, CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, rst_btn, 10, is_bp ? CTP_GREEN : CTP_LAVENDER, false);
+            draw_icon_reset(renderer, cc_x + 28, 258, 20, is_bp ? CTP_GREEN : CTP_LAVENDER);
+            render_text(renderer, font_album, "REESTABLECER 100%", is_bp ? CTP_GREEN : CTP_LAVENDER, cc_x + 48, 240, false);
+            render_text(renderer, font_badge, "Ambos al 100% (Bit-Perfect)", CTP_SUBTEXT0, cc_x + 48, 262, false);
+
+            // 4. Botón Silenciar Ambos / Activar Ambos
+            SDL_Rect mut_all_btn = {cc_x, 296, cc_w, 46};
+            bool all_m = (ml && mr);
+            draw_rounded_rect(renderer, mut_all_btn, 10, all_m ? CTP_RED : CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, mut_all_btn, 10, CTP_SURFACE2, false);
+            if (all_m) {
+                draw_icon_speaker(renderer, cc_x + 28, 319, 16, CTP_CRUST);
+                render_text(renderer, font_album, "ACTIVAR AMBOS", CTP_CRUST, center_x, 310, true);
+            } else {
+                draw_icon_speaker_mute(renderer, cc_x + 28, 319, 16, CTP_PEACH);
+                render_text(renderer, font_album, "SILENCIAR AMBOS", CTP_PEACH, center_x, 310, true);
+            }
+
+            // 5. Botón Ir al Reproductor
+            SDL_Rect play_sc = {cc_x, 352, cc_w, 46};
+            draw_rounded_rect(renderer, play_sc, 10, CTP_SURFACE0, true);
+            draw_rounded_rect(renderer, play_sc, 10, CTP_SURFACE1, false);
+            draw_icon_prev(renderer, cc_x + 28, 375, 14, CTP_LAVENDER);
+            render_text(renderer, font_badge, "IR AL REPRODUCTOR", CTP_LAVENDER, center_x, 366, true);
+
+            // Footer
+            render_text(renderer, font_badge, "Desliza → para INFO DAC | Toca o arrastra barras para regular volumen", CTP_OVERLAY0, center_x, screen_h - 24, true);
+
+            SDL_RenderPresent(renderer);
+            SDL_Delay(33);
+            continue;
+        }
+
+        // =========================================================================
+        // SCREEN 4: MAIN PLAYER SCREEN (SCREEN_PLAYER)
         // =========================================================================
 
-        // Top Navigation Dots (● ○)
+        // Top Navigation Dots (● ○ ○)
         int nav_y = 14;
-        draw_circle_filled(renderer, center_x - 10, nav_y, 4, CTP_LAVENDER);
-        draw_circle_outline(renderer, center_x + 10, nav_y, 4, CTP_OVERLAY0);
+        draw_circle_filled(renderer, center_x - 18, nav_y, 4, CTP_LAVENDER);
+        draw_circle_outline(renderer, center_x, nav_y, 4, CTP_OVERLAY0);
+        draw_circle_outline(renderer, center_x + 18, nav_y, 4, CTP_OVERLAY0);
 
         // Reload cover art if changed
         std::string current_title = state_snap.bluetooth_active ? state_snap.bt_title : state_snap.track_title;

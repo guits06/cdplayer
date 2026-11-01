@@ -48,6 +48,9 @@ int cdda_stop(void);
 int cdda_get_status(CDStatus* out_status);
 int cdda_set_track_title(int track, const char* title);
 int cdda_set_device(const char* device_path);
+int cdda_set_channel_volume(int vol_l, int vol_r);
+int cdda_set_channel_mute(int mute_l, int mute_r);
+int cdda_get_channel_volume(int* out_vol_l, int* out_vol_r, int* out_mute_l, int* out_mute_r);
 void cdda_close(void);
 
 #ifdef __cplusplus

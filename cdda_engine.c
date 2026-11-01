@@ -56,6 +56,12 @@ typedef struct {
     int current_read_lba;
     int reader_end_lba;
 
+    // Channel volume and balance
+    int vol_l;    // 0 - 100, default 100
+    int vol_r;    // 0 - 100, default 100
+    bool mute_l;  // default false
+    bool mute_r;  // default false
+
     // Threading
     pthread_t reader_thread;
     pthread_t player_thread;
@@ -694,11 +700,35 @@ static void* player_thread_func(void* arg) {
         }
 
         snd_pcm_uframes_t frames = n / 4;
+        int vl = g_engine.vol_l;
+        int vr = g_engine.vol_r;
+        bool ml = g_engine.mute_l;
+        bool mr = g_engine.mute_r;
+        const int16_t* src16 = (const int16_t*)read_buf;
+
         if (need_s32) {
-            // Bit-perfect shift to 32-bit container (MSB aligned: original 16 bits untouched)
-            const int16_t* src16 = (const int16_t*)read_buf;
-            for (size_t i = 0; i < frames * 2; i++) {
-                s32_buf[i] = ((int32_t)src16[i]) << 16;
+            if (vl >= 100 && vr >= 100 && !ml && !mr) {
+                // PURE BIT-PERFECT: exact MSB alignment of original 16-bit frames into 32-bit container
+                for (size_t i = 0; i < frames * 2; i++) {
+                    s32_buf[i] = ((int32_t)src16[i]) << 16;
+                }
+            } else {
+                for (size_t f = 0; f < frames; f++) {
+                    int32_t sl = (ml || vl <= 0) ? 0 : (vl >= 100 ? (int32_t)src16[2 * f] : (int32_t)(((int64_t)src16[2 * f] * vl) / 100));
+                    int32_t sr = (mr || vr <= 0) ? 0 : (vr >= 100 ? (int32_t)src16[2 * f + 1] : (int32_t)(((int64_t)src16[2 * f + 1] * vr) / 100));
+                    s32_buf[2 * f] = sl << 16;
+                    s32_buf[2 * f + 1] = sr << 16;
+                }
+            }
+        } else {
+            if (vl < 100 || vr < 100 || ml || mr) {
+                int16_t* dst16 = (int16_t*)read_buf;
+                for (size_t f = 0; f < frames; f++) {
+                    int32_t sl = (ml || vl <= 0) ? 0 : (vl >= 100 ? (int32_t)src16[2 * f] : (int32_t)(((int64_t)src16[2 * f] * vl) / 100));
+                    int32_t sr = (mr || vr <= 0) ? 0 : (vr >= 100 ? (int32_t)src16[2 * f + 1] : (int32_t)(((int64_t)src16[2 * f + 1] * vr) / 100));
+                    dst16[2 * f] = (int16_t)sl;
+                    dst16[2 * f + 1] = (int16_t)sr;
+                }
             }
         }
 
@@ -820,6 +850,10 @@ int cdda_init(const char* device_path, int speed_x) {
     g_engine.speed_x = (speed_x > 0) ? speed_x : 2;
     g_engine.state = 0; // Idle
     g_engine.initialized = true;
+    g_engine.vol_l = 100;
+    g_engine.vol_r = 100;
+    g_engine.mute_l = false;
+    g_engine.mute_r = false;
 
     if (device_path && device_path[0] && access(device_path, F_OK) == 0) {
         strncpy(g_engine.device_path, device_path, sizeof(g_engine.device_path) - 1);
@@ -1044,6 +1078,36 @@ int cdda_get_status(CDStatus* out_status) {
         out_status->duration = g_engine.duration_sec;
     }
 
+    pthread_mutex_unlock(&g_engine.state_mutex);
+    return 0;
+}
+
+int cdda_set_channel_volume(int vol_l, int vol_r) {
+    if (vol_l < 0) vol_l = 0;
+    if (vol_l > 100) vol_l = 100;
+    if (vol_r < 0) vol_r = 0;
+    if (vol_r > 100) vol_r = 100;
+    pthread_mutex_lock(&g_engine.state_mutex);
+    g_engine.vol_l = vol_l;
+    g_engine.vol_r = vol_r;
+    pthread_mutex_unlock(&g_engine.state_mutex);
+    return 0;
+}
+
+int cdda_set_channel_mute(int mute_l, int mute_r) {
+    pthread_mutex_lock(&g_engine.state_mutex);
+    if (mute_l >= 0) g_engine.mute_l = (mute_l != 0);
+    if (mute_r >= 0) g_engine.mute_r = (mute_r != 0);
+    pthread_mutex_unlock(&g_engine.state_mutex);
+    return 0;
+}
+
+int cdda_get_channel_volume(int* out_vol_l, int* out_vol_r, int* out_mute_l, int* out_mute_r) {
+    pthread_mutex_lock(&g_engine.state_mutex);
+    if (out_vol_l) *out_vol_l = g_engine.vol_l;
+    if (out_vol_r) *out_vol_r = g_engine.vol_r;
+    if (out_mute_l) *out_mute_l = g_engine.mute_l ? 1 : 0;
+    if (out_mute_r) *out_mute_r = g_engine.mute_r ? 1 : 0;
     pthread_mutex_unlock(&g_engine.state_mutex);
     return 0;
 }
