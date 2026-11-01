@@ -1559,36 +1559,31 @@ class BluetoothController:
             mode = "both" if module_manager.has_capability("telephony") else "music"
             self.set_mode(mode)
 
-    def _get_active_pcm_path(self):
+    def sync_volume(self):
+        """Synchronizes channel volumes and mute states to ALSA Bluetooth softvol mixer."""
+        with self.state.lock:
+            vl = getattr(self.state, "vol_l", 100)
+            vr = getattr(self.state, "vol_r", 100)
+            ml = getattr(self.state, "mute_l", False)
+            mr = getattr(self.state, "mute_r", False)
+
+        eff_l = 0 if ml else vl
+        eff_r = 0 if mr else vr
+
         try:
-            res = subprocess.run(["bluealsa-cli", "list-pcms"], capture_output=True, text=True, timeout=1.0)
-            for line in res.stdout.strip().splitlines():
-                if "a2dpsnk/source" in line:
-                    return line.strip()
+            # Control ALSA softvol dual-channel mixer directly
+            subprocess.run(
+                ["amixer", "-c", "AUDIO", "set", "Bluetooth", f"{eff_l}%,{eff_r}%"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5
+            )
         except Exception:
             pass
-        return None
 
     def set_volume(self, vol_l, vol_r):
-        """Sets BlueALSA soft-volume for active PCM."""
-        try:
-            pcm = self._get_active_pcm_path()
-            if pcm:
-                avg = max(0, min(100, (vol_l + vol_r) / 2.0))
-                v = int(round(avg * 1.27))
-                subprocess.run(["bluealsa-cli", "volume", pcm, str(v)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0)
-        except Exception:
-            pass
+        self.sync_volume()
 
     def set_mute(self, mute_l, mute_r):
-        """Sets BlueALSA mute switch for active PCM."""
-        try:
-            pcm = self._get_active_pcm_path()
-            if pcm:
-                state_str = "true" if (mute_l or mute_r) else "false"
-                subprocess.run(["bluealsa-cli", "mute", pcm, state_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0)
-        except Exception:
-            pass
+        self.sync_volume()
 
     def _start_aplay(self):
         self._stop_aplay()
@@ -1597,8 +1592,17 @@ class BluetoothController:
         if dac_id == "disconnected":
             dac_id = detect_usb_dac()
         alsa_dev = f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default"
-        # Software volume allows phone AVRCP and internal soft-volume without hardware mixer
-        cmd = ["bluealsa-aplay", "-D", alsa_dev, "--volume=software", "--profile-a2dp"]
+        # If AUDIO DAC and bt_vol ALSA device exists, route via bt_vol for independent dual-channel control
+        if dac_id == "AUDIO" and os.path.exists("/etc/asound.conf"):
+            alsa_dev = "bt_vol"
+
+        cmd = ["bluealsa-aplay", "-D", alsa_dev, "--volume=none", "--profile-a2dp"]
+        try:
+            self.aplay_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[Bluetooth] bluealsa-aplay started on {alsa_dev} (PID: {self.aplay_proc.pid})", flush=True)
+            self.sync_volume()
+        except Exception as e:
+            print(f"[Bluetooth] Error starting bluealsa-aplay: {e}", flush=True)
         try:
             self.aplay_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[Bluetooth] bluealsa-aplay started on {alsa_dev} (PID: {self.aplay_proc.pid})", flush=True)
