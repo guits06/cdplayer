@@ -1335,6 +1335,35 @@ def start_playback_unsafe(track=1, seek_time=0.0):
         stop_playback_unsafe()
 
 
+def sync_external_volume(state_obj=None):
+    """Synchronizes channel volumes and mute states to ALSA Stream/Bluetooth softvol mixer.
+    Ensures independent Left/Right channel volume and mute for Bluetooth and UDP modes."""
+    s = state_obj or state
+    with s.lock:
+        vl = getattr(s, "vol_l", 100)
+        vr = getattr(s, "vol_r", 100)
+        ml = getattr(s, "mute_l", False)
+        mr = getattr(s, "mute_r", False)
+        dac_id = getattr(s, "dac_name", "AUDIO")
+
+    eff_l = 0 if ml else vl
+    eff_r = 0 if mr else vr
+    card = dac_id if dac_id not in ("default", "disconnected") else "AUDIO"
+
+    cmd = ["amixer", "-c", card, "set", "Stream", f"{eff_l}%,{eff_r}%"]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+        if res.returncode != 0:
+            # If mixer control was not found (e.g. after fresh reboot before device open), restore ALSA state
+            subprocess.run(["alsactl", "restore"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.0)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+        # Also sync to Bluetooth control if present
+        subprocess.run(["amixer", "-c", card, "set", "Bluetooth", f"{eff_l}%,{eff_r}%"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+    except Exception:
+        pass
+
+
 def pc_audio_receiver_loop(mode="low"):
     """GStreamer RTP Receiver for PC & Mobile audio sharing with clock synchronization and zero pops."""
     stop_study_streams()
@@ -1348,8 +1377,9 @@ def pc_audio_receiver_loop(mode="low"):
 
     if dac_id == "disconnected":
         dac_id = detect_usb_dac()
-    alsa_dev = f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default"
+    alsa_dev = "stream_vol" if (dac_id == "AUDIO" and os.path.exists("/etc/asound.conf")) else (f"plughw:{dac_id}" if dac_id not in ("default", "disconnected") else "default")
     print(f"Audio Receiver (GStreamer RTP) [Modo: {mode}]: Port 3000, DAC: {alsa_dev}")
+    sync_external_volume(state)
 
     if mode == "ultra_low":
         # Modo ultra baja latencia / gaming (~15ms)
@@ -1560,30 +1590,13 @@ class BluetoothController:
             self.set_mode(mode)
 
     def sync_volume(self):
-        """Synchronizes channel volumes and mute states to ALSA Bluetooth softvol mixer."""
-        with self.state.lock:
-            vl = getattr(self.state, "vol_l", 100)
-            vr = getattr(self.state, "vol_r", 100)
-            ml = getattr(self.state, "mute_l", False)
-            mr = getattr(self.state, "mute_r", False)
-
-        eff_l = 0 if ml else vl
-        eff_r = 0 if mr else vr
-
-        try:
-            # Control ALSA softvol dual-channel mixer directly
-            subprocess.run(
-                ["amixer", "-c", "AUDIO", "set", "Bluetooth", f"{eff_l}%,{eff_r}%"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5
-            )
-        except Exception:
-            pass
+        sync_external_volume(self.state)
 
     def set_volume(self, vol_l, vol_r):
-        self.sync_volume()
+        sync_external_volume(self.state)
 
     def set_mute(self, mute_l, mute_r):
-        self.sync_volume()
+        sync_external_volume(self.state)
 
     def _start_aplay(self):
         self._stop_aplay()
@@ -1601,11 +1614,6 @@ class BluetoothController:
             self.aplay_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[Bluetooth] bluealsa-aplay started on {alsa_dev} (PID: {self.aplay_proc.pid})", flush=True)
             self.sync_volume()
-        except Exception as e:
-            print(f"[Bluetooth] Error starting bluealsa-aplay: {e}", flush=True)
-        try:
-            self.aplay_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[Bluetooth] bluealsa-aplay started on {alsa_dev} (PID: {self.aplay_proc.pid})", flush=True)
         except Exception as e:
             print(f"[Bluetooth] Error starting bluealsa-aplay: {e}", flush=True)
 
@@ -2190,7 +2198,8 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def do_POST(self):
-        parsed_path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        parsed_path = parsed_url.path
 
         if parsed_path == "/api/speedtest":
             content_length = int(self.headers.get('Content-Length', 0))
@@ -2212,6 +2221,13 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                 post_data = json.loads(self.rfile.read(content_length).decode('utf-8'))
             except Exception:
                 pass
+        if parsed_url.query:
+            try:
+                for k, v in parse_qs(parsed_url.query).items():
+                    if k not in post_data and v:
+                        post_data[k] = v[0]
+            except Exception:
+                pass
 
         if parsed_path == "/api/volume/reset":
             with state.lock:
@@ -2225,9 +2241,7 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                         cdda.cdda_set_channel_mute(0, 0)
                     except Exception as e:
                         print(f"Error resetting volume: {e}", flush=True)
-                if state.bluetooth_active:
-                    bluetooth_ctl.set_volume(100, 100)
-                    bluetooth_ctl.set_mute(False, False)
+            sync_external_volume(state)
             self.send_json(state.to_dict())
             return
 
@@ -2251,8 +2265,7 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                         cdda.cdda_set_channel_mute(1 if state.mute_l else 0, 1 if state.mute_r else 0)
                     except Exception as e:
                         print(f"Error setting mute: {e}", flush=True)
-                if state.bluetooth_active:
-                    bluetooth_ctl.set_mute(state.mute_l, state.mute_r)
+            sync_external_volume(state)
             self.send_json(state.to_dict())
             return
 
@@ -2280,9 +2293,7 @@ class CDPlayerHTTPHandler(BaseHTTPRequestHandler):
                         cdda.cdda_set_channel_mute(1 if state.mute_l else 0, 1 if state.mute_r else 0)
                     except Exception as e:
                         print(f"Error setting volume: {e}", flush=True)
-                if state.bluetooth_active:
-                    bluetooth_ctl.set_volume(state.vol_l, state.vol_r)
-                    bluetooth_ctl.set_mute(state.mute_l, state.mute_r)
+            sync_external_volume(state)
             self.send_json(state.to_dict())
             return
 
@@ -2777,6 +2788,7 @@ def run_server():
     httpd_8001 = ReusableThreadingHTTPServer(server_address_8001, CDPlayerHTTPHandler)
     
     print("CD Player Web Control Server running on port 8000 and 8001 (Visualizer)...")
+    sync_external_volume(state)
     
     t_8000 = threading.Thread(target=httpd_8000.serve_forever, daemon=True)
     t_8001 = threading.Thread(target=httpd_8001.serve_forever, daemon=True)

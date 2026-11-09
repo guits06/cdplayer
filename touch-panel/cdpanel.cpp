@@ -1251,7 +1251,7 @@ int main(int argc, char* argv[]) {
                         }
                         queue_action("/api/volume", "{\"vol_r\": " + std::to_string(nv) + ", \"mute_r\": false}");
                         last_touch_action_time = now;
-                    } else if (touch_x >= 120 && touch_x <= 260 && touch_y >= 360 && touch_y <= 425) {
+                    } else if (touch_x >= 120 && touch_x <= 280 && touch_y >= 355 && touch_y <= 430) {
                         // Mute L
                         {
                             std::lock_guard<std::mutex> lk(g_state_mutex);
@@ -1259,7 +1259,7 @@ int main(int argc, char* argv[]) {
                         }
                         queue_action("/api/volume/mute", "{\"channel\": \"L\"}");
                         last_touch_action_time = now;
-                    } else if (touch_x >= 540 && touch_x <= 680 && touch_y >= 360 && touch_y <= 425) {
+                    } else if (touch_x >= 500 && touch_x <= 680 && touch_y >= 355 && touch_y <= 430) {
                         // Mute R
                         {
                             std::lock_guard<std::mutex> lk(g_state_mutex);
@@ -1494,20 +1494,26 @@ int main(int argc, char* argv[]) {
                     Uint32 duration = now - touch_down_time;
 
                     if (abs_dx > 50 && abs_dx > abs_dy * 1.3 && duration < 700) {
-                        if (dx < 0) { // Deslizar dedo hacia la izquierda (avanzar a pantalla de la derecha)
+                        if (dx > 0) { // Deslizar dedo hacia la derecha (avanzar a pantalla siguiente)
                             if (g_current_screen == SCREEN_PLAYER) {
                                 g_current_screen = SCREEN_DAC;
                                 last_touch_action_time = now;
                             } else if (g_current_screen == SCREEN_DAC) {
                                 g_current_screen = SCREEN_VOLUME;
                                 last_touch_action_time = now;
+                            } else if (g_current_screen == SCREEN_VOLUME) {
+                                g_current_screen = SCREEN_PLAYER;
+                                last_touch_action_time = now;
                             }
-                        } else if (dx > 0) { // Deslizar dedo hacia la derecha (volver a pantalla de la izquierda)
+                        } else if (dx < 0) { // Deslizar dedo hacia la izquierda (retroceder a pantalla anterior)
                             if (g_current_screen == SCREEN_VOLUME) {
                                 g_current_screen = SCREEN_DAC;
                                 last_touch_action_time = now;
                             } else if (g_current_screen == SCREEN_DAC) {
                                 g_current_screen = SCREEN_PLAYER;
+                                last_touch_action_time = now;
+                            } else if (g_current_screen == SCREEN_PLAYER) {
+                                g_current_screen = SCREEN_VOLUME;
                                 last_touch_action_time = now;
                             }
                         }
