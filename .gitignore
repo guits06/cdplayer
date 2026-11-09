@@ -14,6 +14,9 @@ modules/cisco_voip/cisco_gateway
 *.o
 release-assets/
 
+# Rust build artifacts
+target/
+
 # Python cache y logs
 __pycache__/
 *.pyc
