@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
+use tokio::sync::RwLock as TokioRwLock;
 
 pub const MODULES_CONFIG_FILE: &str = "/etc/cdplayer_modules.json";
 pub const LOCAL_MODULES_CONFIG_FILE: &str = "modules_config.json";
@@ -36,9 +36,9 @@ struct RawModuleManifest {
 pub struct ModuleManager {
     modules_dir: PathBuf,
     config_file: PathBuf,
-    manifests: Arc<RwLock<HashMap<String, ModuleInfo>>>,
-    enabled_modules: Arc<RwLock<HashSet<String>>>,
-    study_stream_child: Arc<std::sync::Mutex<Option<Child>>>,
+    manifests: Arc<StdRwLock<HashMap<String, ModuleInfo>>>,
+    enabled_modules: Arc<StdRwLock<HashSet<String>>>,
+    study_stream_child: Arc<Mutex<Option<Child>>>,
 }
 
 impl ModuleManager {
@@ -64,9 +64,9 @@ impl ModuleManager {
         let mgr = Self {
             modules_dir,
             config_file,
-            manifests: Arc::new(RwLock::new(HashMap::new())),
-            enabled_modules: Arc::new(RwLock::new(enabled)),
-            study_stream_child: Arc::new(std::sync::Mutex::new(None)),
+            manifests: Arc::new(StdRwLock::new(HashMap::new())),
+            enabled_modules: Arc::new(StdRwLock::new(enabled)),
+            study_stream_child: Arc::new(Mutex::new(None)),
         };
 
         mgr.discover_modules_sync();
@@ -76,7 +76,7 @@ impl ModuleManager {
 
     pub fn discover_modules_sync(&self) {
         let mut map = HashMap::new();
-        let enabled = self.enabled_modules.blocking_read().clone();
+        let enabled = self.enabled_modules.read().unwrap().clone();
 
         if let Ok(entries) = fs::read_dir(&self.modules_dir) {
             for entry in entries.flatten() {
@@ -115,66 +115,26 @@ impl ModuleManager {
             }
         }
 
-        *self.manifests.blocking_write() = map;
+        *self.manifests.write().unwrap() = map;
     }
 
     pub async fn discover_modules(&self) {
-        let mut map = HashMap::new();
-        let enabled = self.enabled_modules.read().await.clone();
-
-        if let Ok(entries) = fs::read_dir(&self.modules_dir) {
-            for entry in entries.flatten() {
-                let mod_path = entry.path();
-                let manifest_path = mod_path.join("module.json");
-                if mod_path.is_dir() && manifest_path.is_file() {
-                    if let Ok(content) = fs::read_to_string(&manifest_path) {
-                        if let Ok(raw) = serde_json::from_str::<RawModuleManifest>(&content) {
-                            let dir_name = mod_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let mod_id = raw.id.unwrap_or(dir_name);
-                            let is_enabled = enabled.contains(&mod_id);
-
-                            map.insert(
-                                mod_id.clone(),
-                                ModuleInfo {
-                                    id: mod_id,
-                                    name: raw.name.unwrap_or_default(),
-                                    version: raw.version.unwrap_or_else(|| "1.0.0".to_string()),
-                                    description: raw.description.unwrap_or_default(),
-                                    author: raw.author.unwrap_or_default(),
-                                    icon: raw.icon.unwrap_or_else(|| "🧩".to_string()),
-                                    capabilities: raw.capabilities.unwrap_or_default(),
-                                    enabled: is_enabled,
-                                    service: raw.service,
-                                    web: raw.web,
-                                    ui: raw.ui,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        *self.manifests.write().await = map;
+        self.discover_modules_sync();
     }
 
     pub async fn list_modules(&self, refresh: bool) -> Vec<ModuleInfo> {
         if refresh {
             self.discover_modules().await;
         }
-        let map = self.manifests.read().await;
+        let map = self.manifests.read().unwrap();
         let mut list: Vec<ModuleInfo> = map.values().cloned().collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
 
     pub async fn has_capability(&self, cap: &str) -> bool {
-        let enabled = self.enabled_modules.read().await;
-        let manifests = self.manifests.read().await;
+        let enabled = self.enabled_modules.read().unwrap();
+        let manifests = self.manifests.read().unwrap();
         for mod_id in enabled.iter() {
             if let Some(m) = manifests.get(mod_id) {
                 if m.capabilities.iter().any(|c| c == cap) {
@@ -186,8 +146,8 @@ impl ModuleManager {
     }
 
     pub async fn get_active_capabilities(&self) -> Vec<String> {
-        let enabled = self.enabled_modules.read().await;
-        let manifests = self.manifests.read().await;
+        let enabled = self.enabled_modules.read().unwrap();
+        let manifests = self.manifests.read().unwrap();
         let mut caps = HashSet::new();
         for mod_id in enabled.iter() {
             if let Some(m) = manifests.get(mod_id) {
@@ -202,7 +162,7 @@ impl ModuleManager {
     }
 
     pub async fn get_module_ui(&self, mod_id: &str) -> Option<ModuleUiData> {
-        let manifests = self.manifests.read().await;
+        let manifests = self.manifests.read().unwrap();
         let m = manifests.get(mod_id)?;
         let ui_cfg = m.ui.as_ref()?;
 
@@ -226,12 +186,12 @@ impl ModuleManager {
 
     pub async fn toggle_module(&self, mod_id: &str, enable: Option<bool>) -> (bool, bool) {
         self.discover_modules().await;
-        let mut manifests = self.manifests.write().await;
+        let mut manifests = self.manifests.write().unwrap();
         if !manifests.contains_key(mod_id) {
             return (false, false);
         }
 
-        let mut enabled = self.enabled_modules.write().await;
+        let mut enabled = self.enabled_modules.write().unwrap();
         let cur = enabled.contains(mod_id);
         let target = enable.unwrap_or(!cur);
 
@@ -276,8 +236,8 @@ impl ModuleManager {
     }
 
     pub fn sync_active_services_sync(&self) {
-        let enabled = self.enabled_modules.blocking_read();
-        let manifests = self.manifests.blocking_read();
+        let enabled = self.enabled_modules.read().unwrap();
+        let manifests = self.manifests.read().unwrap();
         for (mod_id, m) in manifests.iter() {
             if let Some(ref service) = m.service {
                 let act = if enabled.contains(mod_id) {
@@ -290,8 +250,13 @@ impl ModuleManager {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn sync_active_services(&self) {
+        self.sync_active_services_sync();
+    }
+
     // --- Study Mode Native Backend ---
-    pub fn stop_study_stream(&self, state: Arc<RwLock<PlayerState>>) {
+    pub fn stop_study_stream(&self, state: Arc<TokioRwLock<PlayerState>>) {
         let mut lock = self.study_stream_child.lock().unwrap();
         if let Some(mut child) = lock.take() {
             let _ = child.kill();
@@ -319,7 +284,7 @@ impl ModuleManager {
     pub async fn start_study_stream(
         &self,
         audio_type: &str,
-        state: Arc<RwLock<PlayerState>>,
+        state: Arc<TokioRwLock<PlayerState>>,
     ) -> bool {
         self.stop_study_stream(state.clone());
         stop_playback_unsafe(state.clone()).await;

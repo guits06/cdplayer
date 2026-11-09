@@ -224,13 +224,18 @@ async fn handle_get_tracks(State(ctx): State<AppContext>) -> Response {
     };
 
     if !has_tracks && cur_state != "no_disc" {
-        let sr = ctx.state.clone();
-        tokio::task::spawn_blocking(move || {
-            let (t, _, _, _, _) = get_track_list(Some(sr.clone()));
-            if !t.is_empty() {
-                let mut s = sr.blocking_write();
-                s.tracks = t;
-                s.state = "idle".to_string();
+        let sr1 = ctx.state.clone();
+        let sr2 = ctx.state.clone();
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                get_track_list(Some(sr1))
+            }).await;
+            if let Ok((t, _, _, _, _)) = res {
+                if !t.is_empty() {
+                    let mut s = sr2.write().await;
+                    s.tracks = t;
+                    s.state = "idle".to_string();
+                }
             }
         });
     }
@@ -250,10 +255,13 @@ async fn handle_get_play(State(ctx): State<AppContext>, req: Request) -> Respons
         .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
         .unwrap_or(0.0);
 
-    let tr = target_track.unwrap_or_else(|| {
-        let s = ctx.state.blocking_read();
-        s.current_track
-    });
+    let tr = match target_track {
+        Some(t) => t,
+        None => {
+            let s = ctx.state.read().await;
+            s.current_track
+        }
+    };
 
     start_playback_unsafe(ctx.state.clone(), tr, seek_time).await;
     get_snapshot(&ctx).await
@@ -740,17 +748,22 @@ async fn handle_post_load(State(ctx): State<AppContext>) -> Response {
 }
 
 async fn handle_post_refresh(State(ctx): State<AppContext>) -> Response {
-    let sr = ctx.state.clone();
-    tokio::task::spawn_blocking(move || {
-        let (t, _, _, _, _) = get_track_list(Some(sr.clone()));
-        let mut s = sr.blocking_write();
-        s.tracks = t;
-        if !s.tracks.is_empty() {
-            if s.state == "no_disc" {
-                s.state = "idle".to_string();
+    let sr1 = ctx.state.clone();
+    let sr2 = ctx.state.clone();
+    tokio::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || {
+            get_track_list(Some(sr1))
+        }).await;
+        if let Ok((t, _, _, _, _)) = res {
+            let mut s = sr2.write().await;
+            s.tracks = t;
+            if !s.tracks.is_empty() {
+                if s.state == "no_disc" {
+                    s.state = "idle".to_string();
+                }
+            } else {
+                s.state = "no_disc".to_string();
             }
-        } else {
-            s.state = "no_disc".to_string();
         }
     });
 
